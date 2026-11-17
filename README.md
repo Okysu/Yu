@@ -23,6 +23,14 @@ Yu 是一个类型驱动的 Go HTTP 框架。
 go get github.com/Okysu/Yu
 ```
 
+## 文档与示例
+
+- [快速开始](docs/quickstart.md)（English）
+- [进阶用法](docs/advanced.md)（English）
+- [API 参考](docs/api.md)（English）
+- [基准测试](docs/benchmarks.md)（English）
+- 可运行示例：[`examples/quickstart`](examples/quickstart)、[`examples/advanced`](examples/advanced)
+
 ## 快速开始
 
 ```go
@@ -183,6 +191,9 @@ trie.go       路由树节点
 group.go      路由分组
 partition.go  分片调度器与路由选项
 debug.go      拓扑可视化
+docs/         文档：quickstart、advanced、API、benchmarks
+examples/     可运行示例
+benchmarks/   独立模块的框架对比基准
 ```
 
 ## 设计约束

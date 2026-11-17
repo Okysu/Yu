@@ -23,6 +23,15 @@ Requires Go 1.26+.
 go get github.com/Okysu/Yu
 ```
 
+## Documentation and examples
+
+- [Quickstart](docs/quickstart.md)
+- [Advanced usage](docs/advanced.md)
+- [API reference](docs/api.md)
+- [Benchmarks](docs/benchmarks.md)
+- Runnable examples: [`examples/quickstart`](examples/quickstart),
+  [`examples/advanced`](examples/advanced)
+
 ## Quick start
 
 ```go
@@ -183,6 +192,9 @@ trie.go       route tree nodes
 group.go      route groups
 partition.go  sharded scheduler and route options
 debug.go      topology visualisation
+docs/         documentation: quickstart, advanced, API, benchmarks
+examples/     runnable examples
+benchmarks/   comparison harness as a separate module
 ```
 
 ## Design constraints
