@@ -29,7 +29,7 @@ go get github.com/Okysu/Yu
 - [进阶用法](docs/advanced.md)（English）
 - [API 参考](docs/api.md)（English）
 - [基准测试](docs/benchmarks.md)（English）
-- 可运行示例：[`examples/quickstart`](examples/quickstart)、[`examples/advanced`](examples/advanced)
+- 可运行示例：[`examples/quickstart`](examples/quickstart)、[`examples/advanced`](examples/advanced)、[`examples/middleware`](examples/middleware)、[`examples/sse`](examples/sse)
 
 ## 快速开始
 
@@ -157,6 +157,8 @@ e.Provide(db, logger) // 按具体类型注入
 
 匹配优先级：静态段 > `:param` > `*catch-all`。尾部斜杠会被忽略；同一路径位置不允许两个不同的通配符。路径存在但方法不匹配时返回 405（带 `Allow`），否则 404。
 
+需要接入标准 `net/http` 处理器时，用 `r.Raw(pattern, func(w, req))` 或 `r.Handle(pattern, handler)`；它们对全部方法生效并绕过 DAG，路径参数通过 `req.PathValue(name)` 读取。
+
 `Group("/api", nodes...)` 与 `Use(nodes...)` 中的节点不是中间件，它们和路由节点一起并入同一条类型驱动 DAG，顺序完全由类型决定。
 
 ## 编译期规则
@@ -194,7 +196,7 @@ group.go      路由分组
 partition.go  分片调度器与路由选项
 debug.go      拓扑可视化
 docs/         文档：quickstart、advanced、API、benchmarks
-examples/     可运行示例：quickstart、advanced、middleware
+examples/     可运行示例：quickstart、advanced、middleware、sse
 benchmarks/   独立模块的框架对比基准
 ```
 

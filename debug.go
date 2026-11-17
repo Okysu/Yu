@@ -26,8 +26,8 @@ type NodeDTO struct {
 func (engine *Engine) exportTopologies() []RouteTopologyDTO {
 	keys := make([]string, 0, len(engine.router.entries))
 	for k, entry := range engine.router.entries {
-		// Skip internal routes (the inspector itself) to keep the business view clean.
-		if entry.internal {
+		// Skip internal routes and raw handlers: the inspector shows DAGs only.
+		if entry.internal || entry.raw != nil {
 			continue
 		}
 		keys = append(keys, k)

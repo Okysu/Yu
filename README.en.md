@@ -30,7 +30,8 @@ go get github.com/Okysu/Yu
 - [API reference](docs/api.md)
 - [Benchmarks](docs/benchmarks.md)
 - Runnable examples: [`examples/quickstart`](examples/quickstart),
-  [`examples/advanced`](examples/advanced)
+  [`examples/advanced`](examples/advanced),
+  [`examples/middleware`](examples/middleware), [`examples/sse`](examples/sse)
 
 ## Quick start
 
@@ -158,6 +159,8 @@ Containers are private and exposed only through read-only accessors, so skills i
 
 Match precedence: static segment > `:param` > `*catch-all`. Trailing slashes are ignored; two different wildcards at the same position are rejected. A known path with the wrong method returns 405 with an `Allow` header, otherwise 404.
 
+To mount a standard `net/http` handler, use `r.Raw(pattern, func(w, req))` or `r.Handle(pattern, handler)`. They cover every method, bypass the DAG, and expose path parameters through `req.PathValue(name)`.
+
 Nodes passed to `Group("/api", nodes...)` or `Use(nodes...)` are not middleware. They join the same type-driven DAG as route nodes, and ordering is decided purely by types.
 
 ## Compile-time rules
@@ -195,7 +198,7 @@ group.go      route groups
 partition.go  sharded scheduler and route options
 debug.go      topology visualisation
 docs/         documentation: quickstart, advanced, API, benchmarks
-examples/     runnable examples: quickstart, advanced, middleware
+examples/     runnable examples: quickstart, advanced, middleware, sse
 benchmarks/   comparison harness as a separate module
 ```
 

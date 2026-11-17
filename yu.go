@@ -191,6 +191,14 @@ func (engine *Engine) addRoute(method, pattern string, items ...any) {
 	})
 }
 
+// addRawRoute registers a plain net/http handler. Raw routes bypass the DAG,
+// route options and group nodes.
+func (engine *Engine) addRawRoute(method, pattern string, handler http.Handler) {
+	key := method + "-" + pattern
+	log.Printf("[Yu Compiler] Route %-22s -> raw http.Handler", key)
+	engine.router.addRoute(method, pattern, &routeEntry{raw: handler})
+}
+
 // ServeHTTP implements http.Handler.
 func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	entry, params := engine.router.getRoute(req.Method, req.URL.Path)
@@ -201,6 +209,17 @@ func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		http.NotFound(w, req)
+		return
+	}
+
+	// Raw handlers receive the untouched request. Path parameters are exposed
+	// through the standard net/http accessor (Go 1.22+), so third-party
+	// handlers can read them without knowing about Yu.
+	if entry.raw != nil {
+		for name, value := range params {
+			req.SetPathValue(name, value)
+		}
+		entry.raw.ServeHTTP(w, req)
 		return
 	}
 

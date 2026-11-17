@@ -1,6 +1,7 @@
 package yu
 
 import (
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -12,7 +13,8 @@ type routeEntry struct {
 	timeout   time.Duration
 	bodyLimit int64
 	internal  bool
-	parts     []string // parsed pattern, computed once at registration
+	parts     []string     // parsed pattern, computed once at registration
+	raw       http.Handler // non-nil for Raw/Handle routes; bypasses the DAG
 }
 
 type router struct {

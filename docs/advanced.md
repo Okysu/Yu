@@ -246,6 +246,44 @@ middleware concept inside the DAG: nodes are causal skills, not wrappers. A
 wrapper can observe the final status and headers, but it cannot reorder or
 cancel DAG nodes.
 
+## Raw handlers, third-party compatibility and streaming
+
+`Raw` and `Handle` register a standard net/http handler for every method,
+bypassing the DAG:
+
+```go
+engine.Raw("/legacy/:id", func(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id") // path parameters use the standard accessor
+	thirdPartyHandler.ServeHTTP(w, r)
+})
+```
+
+Raw routes ignore group nodes, route options (timeout, body limit,
+partitioning) and the blackboard. They are also excluded from the DAG
+inspector. Use them for third-party handlers and for anything that needs the
+`http.ResponseWriter` directly.
+
+**Streaming:** the DAG path always produces a fully buffered `yu.Response`, so
+it cannot stream. SSE, chunked responses and WebSocket upgrades must be
+registered with `Raw`/`Handle`. See [`examples/sse`](../examples/sse):
+
+```go
+engine.Raw("/events", func(w http.ResponseWriter, r *http.Request) {
+	flusher := w.(http.Flusher)
+	w.Header().Set("Content-Type", "text/event-stream")
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+			fmt.Fprintf(w, "data: tick\n\n")
+			flusher.Flush()
+			time.Sleep(time.Second)
+		}
+	}
+})
+```
+
 ## Graceful shutdown
 
 `Engine.Run` is a convenience wrapper around `http.ListenAndServe`, which has no

@@ -20,6 +20,12 @@ type enginePairA struct{}
 type enginePairB struct{}
 type engineIDValue struct{ ID string }
 
+type engineRawStatus struct{ status int }
+
+func (h engineRawStatus) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(h.status)
+}
+
 func serve(e *Engine, method, target string, body io.Reader) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	e.ServeHTTP(w, httptest.NewRequest(method, target, body))
@@ -284,6 +290,7 @@ func TestEngineNestedGroupsAndUse(t *testing.T) {
 func TestEngineDebugEndpoint(t *testing.T) {
 	e := New()
 	e.GET("/ping", func(req Request) Response { return Text(200, "pong") })
+	e.Raw("/raw", func(w http.ResponseWriter, req *http.Request) {})
 	e.EnableDebugDAG("/_yu/topology")
 
 	w := serve(e, "GET", "/_yu/topology?format=json", nil)
@@ -300,6 +307,9 @@ func TestEngineDebugEndpoint(t *testing.T) {
 	for _, topo := range tops {
 		if topo.RouteKey == "GET-/_yu/topology" {
 			t.Fatalf("internal route must not list itself")
+		}
+		if topo.RouteKey == "GET-/raw" {
+			t.Fatalf("raw route must not appear in DAG topologies")
 		}
 		if topo.RouteKey == "GET-/ping" {
 			foundPing = true
@@ -407,6 +417,57 @@ func TestEngineInlineWaveLimit(t *testing.T) {
 			t.Fatalf("inlineWaveLimit not applied")
 		}
 	})
+}
+
+func TestEngineRawHandler(t *testing.T) {
+	e := New()
+	var gotID string
+
+	e.Raw("/raw/:id", func(w http.ResponseWriter, req *http.Request) {
+		gotID = req.PathValue("id")
+		w.Header().Set("X-Raw", "1")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("raw"))
+	})
+
+	w := serve(e, "POST", "/raw/42", nil)
+	if w.Code != http.StatusCreated || w.Body.String() != "raw" {
+		t.Fatalf("raw = %d %q", w.Code, w.Body.String())
+	}
+	if w.Header().Get("X-Raw") != "1" {
+		t.Fatal("raw handler header missing")
+	}
+	if gotID != "42" {
+		t.Fatalf("PathValue = %q", gotID)
+	}
+
+	// Raw registers every method.
+	if w := serve(e, "DELETE", "/raw/7", nil); w.Code != http.StatusCreated {
+		t.Fatalf("raw route registered for only one method: %d", w.Code)
+	}
+}
+
+func TestEngineHandleAdapter(t *testing.T) {
+	e := New()
+	e.Handle("/third-party", engineRawStatus{status: http.StatusTeapot})
+
+	if w := serve(e, "GET", "/third-party", nil); w.Code != http.StatusTeapot {
+		t.Fatalf("status = %d, want 418", w.Code)
+	}
+}
+
+func TestEngineRawBypassesDAG(t *testing.T) {
+	e := New()
+	g := e.Group("/g", func(req Request) Response {
+		panic("group node must not run for raw routes")
+	})
+	g.Raw("/raw", func(w http.ResponseWriter, req *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	if w := serve(e, "GET", "/g/raw", nil); w.Code != http.StatusOK || w.Body.String() != "ok" {
+		t.Fatalf("raw group route = %d %q", w.Code, w.Body.String())
+	}
 }
 
 func TestEngineConcurrentRequestsAreIsolated(t *testing.T) {

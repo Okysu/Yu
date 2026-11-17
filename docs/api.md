@@ -53,6 +53,9 @@ func (group *RouterGroup) PATCH(pattern string, nodes ...any)
 func (group *RouterGroup) HEAD(pattern string, nodes ...any)
 func (group *RouterGroup) OPTIONS(pattern string, nodes ...any)
 func (group *RouterGroup) Any(pattern string, nodes ...any)
+
+func (group *RouterGroup) Raw(pattern string, handler http.HandlerFunc)
+func (group *RouterGroup) Handle(pattern string, handler http.Handler)
 ```
 
 Route methods accept skills and `RouteOption` values in any order; options are
@@ -60,6 +63,14 @@ extracted and applied to the route.
 
 Group nodes are merged into the same DAG as route nodes. They are not
 middleware and have no registration-order semantics.
+
+`Raw` and `Handle` register an ordinary net/http handler for **every** HTTP
+method. They bypass the DAG entirely: group nodes, route options, timeouts,
+body limits and partition scheduling do not apply. The handler receives the
+original request; path parameters are exposed through `req.PathValue(name)`
+(Go 1.22+). This is the escape hatch for third-party handlers and for streaming
+responses (SSE, chunked, WebSocket). Raw routes are excluded from the DAG
+inspector.
 
 `Any` registers the route for `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`
 and `OPTIONS`.
