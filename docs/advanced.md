@@ -203,6 +203,27 @@ engine.EnableDebugDAG("/debug/dag")
 
 The inspector never lists itself.
 
+## Inline waves
+
+By default only single-node waves run inline; multi-node waves spawn one
+goroutine per skill. If a wave is CPU-trivial, goroutine setup can cost more
+than the work it overlaps:
+
+```go
+engine.GET("/tiny", yu.WithInlineWaveLimit(2), skillA, skillB, respond)
+```
+
+The default is `1`. The measured trade-off with two skills:
+
+| wave | parallel | inline |
+|---|---:|---:|
+| trivial CPU skills | 3.3 µs | **0.96 µs** |
+| 2 ms I/O calls | **2.14 ms** | 4.24 ms |
+
+Raise the limit only when the wave contains no I/O. The engine cannot infer
+cost at compile time, which is why serializing small waves is opt-in rather
+than a default.
+
 ## Performance notes
 
 - Keep skills pure and allocation-light; the engine adds reflection calls and

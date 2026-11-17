@@ -19,10 +19,11 @@ type RouteOption interface {
 }
 
 type routeConfig struct {
-	keyFn     PartitionKeyFunc
-	workers   int
-	timeout   time.Duration
-	bodyLimit int64
+	keyFn           PartitionKeyFunc
+	workers         int
+	timeout         time.Duration
+	bodyLimit       int64
+	inlineWaveLimit int
 }
 
 type partitionOption struct {
@@ -70,6 +71,22 @@ func (o bodyLimitOption) apply(cfg *routeConfig) {
 // rejected with 413 Request Entity Too Large. maxBytes <= 0 disables the limit.
 func WithBodyLimit(maxBytes int64) RouteOption {
 	return bodyLimitOption{maxBytes: maxBytes}
+}
+
+type inlineWaveOption struct {
+	maxNodes int
+}
+
+func (o inlineWaveOption) apply(cfg *routeConfig) {
+	cfg.inlineWaveLimit = o.maxNodes
+}
+
+// WithInlineWaveLimit runs waves containing at most maxNodes skills
+// sequentially instead of spawning goroutines. The default is 1 (only
+// single-node waves are inlined). Raise it when tiny waves are dominated by
+// scheduling overhead; keep it low when waves contain real I/O.
+func WithInlineWaveLimit(maxNodes int) RouteOption {
+	return inlineWaveOption{maxNodes: maxNodes}
 }
 
 type partitionTask struct {

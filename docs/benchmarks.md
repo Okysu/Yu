@@ -1,8 +1,11 @@
 # Benchmarks
 
 These benchmarks compare Yu with popular Go HTTP frameworks on the same
-business routes. The goal is to show both the costs and the benefits of a
-type-driven DAG, not to declare a winner.
+business routes. They also measure two specific design questions:
+
+1. How does Yu's automatic fan-out compare with hand-written concurrency
+   (`errgroup`)?
+2. What do the per-request allocation optimizations actually buy?
 
 The harness lives in [`benchmarks/`](../benchmarks). It is a separate Go module
 so the framework itself stays dependency-free.
@@ -23,60 +26,57 @@ Frameworks compared:
 | Label | Framework | HTTP stack |
 |---|---|---|
 | `stdlib` | `net/http` + Go 1.22 `ServeMux` | net/http |
-| `gin` | Gin | net/http |
+| `gin` | Gin, ordinary handlers | net/http |
+| `gin-errgroup` | Gin, hand-written `errgroup` fan-out | net/http |
 | `echo` | Echo | net/http |
 | `chi` | chi | net/http |
 | `fiber` | Fiber | fasthttp |
 | `yu` | Yu | net/http |
 
+`gin-errgroup` uses the same routes as `gin`; only `/compute` and `/io` are
+written with `errgroup` instead of sequential calls. It is the fair control for
+the "you would have written this by hand" comparison.
+
 Fiber uses fasthttp, so it is a reference point rather than an apples-to-apples
-comparison. All JSON encoding uses each framework's default encoder.
+comparison. Every framework uses its own default JSON encoder.
 
 ## Routes
-
-Every implementation serves the same business logic:
 
 | Route | Work |
 |---|---|
 | `GET /ping` | Plain text response |
 | `GET /users/:id` | Path parameter, JSON response |
 | `POST /users` | JSON body decode, JSON response |
-| `GET /compute` | Three independent CPU tasks, merged into one JSON response |
+| `GET /compute` | Three independent CPU tasks (~219 µs each), merged into one JSON response |
+| `GET /io` | Three independent downstream calls, simulated with `time.Sleep(2ms)` each |
 | `GET /r499` | Static route among 500 registered routes |
 
-For `/compute`, Yu declares three skills producing distinct types. They land in
-one wave and run concurrently; the other frameworks call the three functions
-sequentially. That is the same business logic, expressed in each framework's
-natural style.
-
-Each task (`digest`) takes about **219 µs** on this machine.
+For `/compute` and `/io`, Yu declares three skills producing distinct types.
+They land in one wave and run concurrently; the plain frameworks call them
+sequentially; `gin-errgroup` runs them in three goroutines.
 
 ## Methodology
 
-- Real TCP servers, real `net/http` clients, 2 s per sub-benchmark.
-- Three runs per benchmark; the table reports the **median**.
+- Real TCP servers and `net/http` clients, 2 s per sub-benchmark.
+- Three runs per benchmark; tables report the **median**.
 - Each benchmark runs in a fresh process to avoid cross-benchmark warm-up bias.
+- Latency benchmarks use one sequential client and report p50/p99 in addition
+  to the mean.
 - 20 warm-up requests before the timer starts.
 - Throughput benchmarks use `b.RunParallel` (28 goroutines against the server).
-- Latency benchmarks use a single sequential client to keep most cores idle.
-- Default `GOGC`. A GC-off run is included separately because allocation
-  pressure turns out to dominate several results.
+- Default `GOGC`; a GC-off reference run is included separately.
+- The optimized framework was compared against the previous revision in a git
+  worktree using the same benchmark binary, in both run orders, to separate
+  real changes from hybrid-core variance.
 
-Run them yourself (each benchmark in a fresh process, matching the numbers
-above):
+Run them yourself:
 
 ```bash
 cd benchmarks
-for bench in Ping PingLatency GetUser CreateUser Fanout FanoutLatency ManyRoutes; do
+for bench in Ping PingLatency GetUser CreateUser Fanout FanoutLatency \
+             IOFanout IOFanoutLatency ManyRoutes; do
   go test -run '^$' -bench "^Benchmark${bench}$" -benchmem -benchtime=2s -count=3
 done
-```
-
-For a quick overview in one process:
-
-```bash
-cd benchmarks
-go test -run '^$' -bench . -benchmem -benchtime=2s
 ```
 
 ## Throughput (parallel clients)
@@ -88,98 +88,136 @@ server.
 
 | framework | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| stdlib | 13,655 | 10,120 | 76 |
-| gin | 12,579 | 10,052 | 76 |
-| echo | 10,265 | 9,084 | 75 |
-| chi | 10,865 | 9,609 | 77 |
-| fiber | 9,384 | 6,022 | 54 |
-| **yu** | **12,521** | **12,219** | **100** |
+| stdlib | 13,831 | 10,024 | 76 |
+| gin | 13,333 | 10,218 | 76 |
+| gin-errgroup | 12,350 | 9,873 | 76 |
+| echo | 10,949 | 9,274 | 76 |
+| chi | 10,676 | 9,552 | 77 |
+| fiber | 9,567 | 6,060 | 54 |
+| **yu** | **12,509** | **11,956** | **95** |
 
 ### GetUser (path param + JSON)
 
 | framework | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| stdlib | 13,574 | 10,281 | 80 |
-| gin | 14,341 | 10,735 | 82 |
-| echo | 11,204 | 9,518 | 79 |
-| chi | 11,596 | 10,279 | 83 |
-| fiber | 9,406 | 6,196 | 58 |
-| **yu** | **13,341** | **12,905** | **107** |
+| stdlib | 14,433 | 10,470 | 80 |
+| gin | 14,645 | 10,781 | 82 |
+| gin-errgroup | 11,701 | 9,605 | 80 |
+| echo | 11,519 | 9,545 | 80 |
+| chi | 12,159 | 10,335 | 83 |
+| fiber | 9,385 | 6,179 | 58 |
+| **yu** | **13,511** | **12,688** | **102** |
 
 ### CreateUser (JSON in / JSON out)
 
 | framework | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| stdlib | 12,312 | 21,000 | 102 |
-| gin | 12,749 | 21,768 | 106 |
-| echo | 11,594 | 20,092 | 104 |
-| chi | 12,732 | 22,318 | 105 |
-| fiber | 7,379 | 9,199 | 73 |
-| **yu** | **14,540** | **24,970** | **126** |
+| stdlib | 12,482 | 20,994 | 102 |
+| gin | 12,972 | 21,369 | 106 |
+| gin-errgroup | 12,787 | 21,617 | 106 |
+| echo | 12,070 | 20,427 | 104 |
+| chi | 11,505 | 19,755 | 104 |
+| fiber | 7,307 | 10,416 | 74 |
+| **yu** | **15,278** | **25,191** | **122** |
 
 ### Fanout (three CPU tasks, saturated cores)
 
 | framework | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| stdlib | 50,934 | 13,035 | 85 |
-| gin | 51,144 | 13,276 | 87 |
-| echo | 50,112 | 13,152 | 86 |
-| chi | 50,574 | 13,558 | 88 |
-| fiber | 44,293 | 9,600 | 64 |
-| **yu** | **56,727** | **17,840** | **134** |
+| stdlib | 51,862 | 13,023 | 85 |
+| gin | 51,883 | 13,305 | 87 |
+| gin-errgroup | 46,792 | 13,004 | 96 |
+| echo | 50,479 | 13,046 | 86 |
+| chi | 50,590 | 13,423 | 88 |
+| fiber | 43,319 | 9,269 | 65 |
+| **yu** | **55,466** | **17,847** | **130** |
 
-Under saturation every core is busy, so parallelizing *inside* a request does
-not reduce total CPU work; Yu pays goroutine and reflection overhead instead.
-This is the expected trade-off.
+When every core is busy, parallelizing inside a request cannot reduce total CPU
+work. Yu and `gin-errgroup` pay scheduling and reflection overhead here; both
+are close behind the sequential frameworks and Fiber.
 
 ### ManyRoutes (500 routes registered)
 
 | framework | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| stdlib | 10,944 | 9,198 | 75 |
-| gin | 10,703 | 9,148 | 75 |
-| echo | 9,882 | 8,657 | 75 |
-| chi | 10,383 | 9,192 | 76 |
-| fiber | 2,854 | 4,261 | 52 |
-| **yu** | **4,866** | **14,356** | **99** |
+| stdlib | 10,881 | 9,172 | 75 |
+| gin | 10,914 | 9,286 | 75 |
+| gin-errgroup | 11,651 | 9,525 | 75 |
+| echo | 9,915 | 8,916 | 75 |
+| chi | 10,285 | 9,436 | 77 |
+| fiber | 2,994 | 4,281 | 52 |
+| **yu** | **4,940** | **13,324** | **92** |
 
-Note: registering 500 routes raises the live heap, which reduces GC frequency
-during measurement. Absolute numbers are therefore lower than `Ping` for every
-framework; compare frameworks within this row, not across rows.
+Registering 500 routes raises the live heap and reduces GC frequency during
+measurement, so absolute numbers are lower than `Ping` for every framework.
+Compare frameworks within this row.
 
 ## Latency (single client)
-
-With one request in flight, most cores are idle and intra-request parallelism
-can pay off.
 
 ### Ping latency
 
 | framework | ns/op |
 |---|---:|
-| stdlib | 32,669 |
-| gin | 33,295 |
-| echo | 33,922 |
-| chi | 33,185 |
-| fiber | 28,265 |
-| **yu** | **35,370** |
+| stdlib | 32,580 |
+| gin | 32,294 |
+| gin-errgroup | 33,346 |
+| echo | 31,768 |
+| chi | 33,775 |
+| fiber | 28,487 |
+| **yu** | **36,135** |
 
 Loopback round-trip cost dominates; Yu's extra allocations add a few
 microseconds.
 
-### Fanout latency
+### CPU fanout latency
 
 | framework | ns/op |
 |---|---:|
-| stdlib | 691,629 |
-| gin | 691,162 |
-| echo | 691,861 |
-| chi | 692,651 |
-| fiber | 688,103 |
-| **yu** | **320,584** |
+| stdlib | 697,910 |
+| gin | 702,467 |
+| gin-errgroup | 296,167 |
+| echo | 692,217 |
+| chi | 689,136 |
+| fiber | 691,152 |
+| **yu** | **331,294** |
 
-The three tasks take ~657 µs sequentially. Yu's automatic fan-out cuts the
-request latency to about **2.15×** below the others, with no concurrency code
-in the skills.
+Three 219 µs tasks take ~656 µs sequentially. Yu's automatic wave execution and
+the hand-written `errgroup` version both cut latency to roughly a third, with no
+concurrency code in the skills.
+
+### I/O fanout latency (p50 / p99)
+
+Three simulated downstream calls, 2 ms each:
+
+| framework | ns/op | p50 (µs) | p99 (µs) |
+|---|---:|---:|---:|
+| stdlib | 6,197,399 | 6,193 | 6,375 |
+| gin | 6,227,292 | 6,194 | 6,595 |
+| gin-errgroup | 2,210,114 | 2,195 | 2,430 |
+| echo | 6,183,522 | 6,165 | 6,496 |
+| chi | 6,246,545 | 6,190 | 6,544 |
+| fiber | 6,169,392 | 6,153 | 6,409 |
+| **yu** | **2,219,580** | **2,194** | **2,549** |
+
+Yu and `gin-errgroup` are statistically indistinguishable at p50. Yu's p99 is
+about 120 µs higher in this run (2.55 ms vs 2.43 ms), consistent with the
+additional per-request allocation and reflection work.
+
+### I/O fanout throughput
+
+| framework | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| stdlib | 239,164 | 9,844 | 81 |
+| gin | 238,796 | 10,176 | 83 |
+| gin-errgroup | 96,787 | 11,828 | 91 |
+| echo | 237,838 | 9,347 | 82 |
+| chi | 238,576 | 9,799 | 83 |
+| fiber | 239,012 | 6,481 | 61 |
+| **yu** | **98,138** | **16,196** | **137** |
+
+Under saturation, overlapping sleeps still wins because the waiting does not
+consume CPU: all three parallel variants are ~2.4× faster than the sequential
+ones.
 
 ## Engine isolation
 
@@ -188,44 +226,101 @@ Measured directly on the DAG, without HTTP:
 | benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
 | `Digest` (one task) | 218,945 | 0 | 0 |
-| `YuSequentialFanout` (three tasks, no engine) | 657,439 | 0 | 0 |
-| `YuDAGFanout` (three-task wave + merge + JSON) | 232,096 | 2,662 | 39 |
-| `YuCompile` (single-skill route) | ~260 | 248 | 8 |
+| `YuSequentialFanout` (three tasks, no engine) | 656,400 | 0 | 0 |
+| `YuDAGFanout` (three-task wave + merge + JSON) | 231,414 | 2,141 | 34 |
+| `YuCompile` (single-skill route) | ~318 | 376 | 11 |
 
-The wave scheduler turns 657 µs of sequential work into 232 µs end-to-end,
+The wave scheduler turns ~656 µs of sequential work into ~231 µs end-to-end,
 close to the single-task floor (219 µs).
+
+## Inline-wave trade-off
+
+`WithInlineWaveLimit(n)` makes waves with at most `n` skills run sequentially,
+starting no goroutines. The default is `1`, which only affects the single-node
+fast path. The option is a trade-off:
+
+| two-skill wave | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| tiny CPU skills, parallel | 3,334 | 1,443 | 22 |
+| tiny CPU skills, inline | **957** | **975** | **15** |
+| 2 ms I/O calls, parallel | **2,138,000** | 2,388 | 35 |
+| 2 ms I/O calls, inline | 4,235,000 | 2,030 | 29 |
+
+Inlining is ~3.5× faster for trivial CPU skills and ~2× slower for latency-bound
+skills. That is why the default stays at 1: the engine cannot know a skill's
+cost at compile time, and silently serializing a two-call I/O route would be a
+bad default. Raise it per route only when you know the wave is CPU-trivial:
+
+```go
+engine.GET("/tiny", yu.WithInlineWaveLimit(2), skillA, skillB, respond)
+```
 
 ## GC-off reference
 
-With `GOGC=off`, the per-request allocation differences stop mattering:
+With `GOGC=off`, allocation differences stop mattering:
 
 | framework | Ping ns/op | Ping allocs/op |
 |---|---:|---:|
-| stdlib | 2,262 | 72 |
-| gin | 2,165 | 71 |
-| echo | 2,180 | 72 |
-| chi | 2,196 | 74 |
-| fiber | 2,245 | 52 |
-| **yu** | **2,261** | **97** |
+| stdlib | 2,235 | 72 |
+| gin | 2,223 | 71 |
+| gin-errgroup | 2,227 | 71 |
+| echo | 2,246 | 72 |
+| chi | 2,248 | 74 |
+| fiber | 2,292 | 52 |
+| **yu** | **2,324** | **91** |
 
 All frameworks converge to ~2.2 µs. Routing and serving CPU are on par; the
-gap under default GC comes from Yu's per-request allocations (blackboard map,
-reflection argument slices).
+default-GC gap comes from per-request allocations.
+
+## Optimization impact
+
+The following changes were measured against the previous revision:
+
+- pooled per-route blackboards;
+- no params map for static routes;
+- pooled reflection argument slices per `FuncNode`;
+- no query parsing when the request has no query string;
+- an opt-in inline-wave limit.
+
+| benchmark | before ns/op | after ns/op | before allocs | after allocs | before B/op | after B/op |
+|---|---:|---:|---:|---:|---:|---:|
+| Ping | 12,521 | 12,509 | 100 | **95** | 12,219 | **11,956** |
+| GetUser | 13,341 | 13,511 | 107 | **102** | 12,905 | **12,688** |
+| CreateUser | 14,540 | 15,278 | 126 | **122** | 24,970 | 25,191 |
+| Fanout | 56,727 | 55,466 | 134 | **130** | 17,840 | 17,847 |
+| FanoutLatency | 320,584 | 331,294 | 126 | **117** | 11,057 | **10,601** |
+| ManyRoutes | 4,866 | 4,940 | 99 | **92** | 14,356 | **13,324** |
+| IOFanout | 98,558 | 98,138 | 142 | **137** | 16,049 | 16,196 |
+| IOFanoutLatency p50 | 2,184 µs | 2,194 µs | 137 | **128** | 11,831 | **11,324** |
+| IOFanoutLatency p99 | 2,517 µs | 2,549 µs | — | — | — | — |
+| `YuDAGFanout` | 232,096 | 231,414 | 39 | **34** | 2,662 | **2,141** |
+| `YuCompile` | ~260 | ~318 | 8 | 11 | 248 | 376 |
+
+Interpretation:
+
+- **Allocations drop 4–18%** and bytes drop up to 21% on multi-node routes.
+- **CPU time is unchanged within noise.** Pooling does not make a fast request
+  faster; it reduces GC pressure and retained memory. The compile cost rises by
+  ~60 ns per route (startup only) because pools are created eagerly.
+- A completion-channel wave executor was tried and reverted: it was ~8 µs
+  slower than `sync.WaitGroup` + a watcher on the 3-task wave, in both run
+  orders.
+- Inline waves are a real win (3.5×) only for CPU-trivial waves; they are a
+  loss (2×) for I/O waves, hence opt-in.
 
 ## Findings
 
 1. **Simple routes:** Yu is within roughly 10–20% of Gin/Echo/chi under default
-   GC, and slightly slower than the fasthttp-based Fiber.
-2. **Allocation pressure is the main cost.** Yu creates one blackboard map and
-   reflection argument slices per request. With GC disabled, Ping matches the
-   fastest net/http frameworks.
-3. **Fan-out is a latency optimization, not a throughput one.** With idle
-   cores, three concurrent skills are ~2.15× faster end-to-end. Under CPU
-   saturation, the same fan-out adds ~12% overhead.
-4. **Compilation is cheap.** A single-skill route compiles in ~260 ns at
-   startup.
-5. **Many routes scale fine.** Yu's trie plus precompiled pipelines stay
-   competitive at 500 routes.
+   GC, and slower than the fasthttp-based Fiber.
+2. **Allocation pressure is the main cost.** With GC disabled, Ping matches the
+   fastest net/http frameworks. Pooling cuts allocations but does not change
+   steady-state CPU time.
+3. **Fan-out is a latency optimization.** With idle cores, three concurrent
+   CPU or I/O tasks cut latency ~2–2.2× and match a hand-written `errgroup`
+   implementation. Under CPU saturation it adds ~10% overhead.
+4. **Compilation is cheap.** A single-skill route compiles in ~320 ns at
+   startup, including pool setup.
+5. **Many routes scale fine.** Yu stays competitive with 500 routes.
 
 ## Caveats
 
@@ -233,18 +328,8 @@ reflection argument slices).
   frequency scaling add run-to-run variance.
 - Loopback HTTP overhead is included; real network latency changes the balance.
 - Fiber uses a different HTTP stack and is not directly comparable.
-- No database or external I/O is involved; the `/compute` route simulates CPU
-  work.
-
-## Possible optimizations
-
-The allocation gap suggests concrete follow-ups:
-
-- pool the per-request blackboard per compiled route;
-- avoid allocating the params map when a route has no path parameters;
-- cache reflection argument slices per `FuncNode`;
-- avoid spawning goroutines for waves whose skills are cheaper than the
-  scheduling overhead.
+- `/io` uses `time.Sleep`; no real database or network call is involved.
+- `gin-errgroup` is a hand-written control. It is not a framework feature.
 
 ## Related benchmarks
 

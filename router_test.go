@@ -162,6 +162,34 @@ func TestRouterTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestRouterStaticRouteAllocatesNoParams(t *testing.T) {
+	r := newRouter()
+	entry := &routeEntry{}
+	r.addRoute("GET", "/static/path", entry)
+
+	got, params := r.getRoute("GET", "/static/path")
+	if got != entry {
+		t.Fatal("static route not found")
+	}
+	if params != nil {
+		t.Fatalf("static route allocated params: %v", params)
+	}
+}
+
+func TestRouterWildcardRouteAllocatesParams(t *testing.T) {
+	r := newRouter()
+	entry := &routeEntry{}
+	r.addRoute("GET", "/users/:id", entry)
+
+	got, params := r.getRoute("GET", "/users/42")
+	if got != entry {
+		t.Fatal("wildcard route not found")
+	}
+	if params["id"] != "42" {
+		t.Fatalf("params = %v", params)
+	}
+}
+
 func TestRouterWildcardConflictPanics(t *testing.T) {
 	r := newRouter()
 	r.addRoute("GET", "/user/:id", &routeEntry{})

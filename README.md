@@ -152,6 +152,7 @@ e.Provide(db, logger) // 按具体类型注入
 |---|---|
 | `yu.WithTimeout(d)` | 路由级超时，超时返回 504 |
 | `yu.WithBodyLimit(n)` | 请求体上限，超限返回 413（默认不限制） |
+| `yu.WithInlineWaveLimit(n)` | 含 ≤n 个技能的 wave 顺序执行、不启动 goroutine（默认 1，仅单节点） |
 | `yu.PartitionBy(keyFn, workers...)` | 分片串行调度，默认 32 条 lane |
 
 匹配优先级：静态段 > `:param` > `*catch-all`。尾部斜杠会被忽略；同一路径位置不允许两个不同的通配符。路径存在但方法不匹配时返回 405（带 `Allow`），否则 404。

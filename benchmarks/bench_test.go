@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/gofiber/fiber/v2"
 	"github.com/labstack/echo/v4"
+	"golang.org/x/sync/errgroup"
 
 	yu "github.com/Okysu/Yu"
 )
@@ -37,6 +40,7 @@ import (
 const (
 	manyRoutes    = 500
 	computeRounds = 200000
+	ioDelay       = 2 * time.Millisecond
 )
 
 type userResponse struct {
@@ -73,6 +77,66 @@ func mergeDigests(a digestA, b digestB, c digestC) yu.Response {
 	return yu.JSON(http.StatusOK, map[string]uint64{"sum": a.V + b.V + c.V})
 }
 
+// Simulated downstream I/O: three independent calls, each latency-bound.
+type (
+	ioA struct{ V int }
+	ioB struct{ V int }
+	ioC struct{ V int }
+)
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func ioTaskA(req yu.Request) (ioA, error) {
+	if err := sleepCtx(req.Context, ioDelay); err != nil {
+		return ioA{}, err
+	}
+	return ioA{V: 1}, nil
+}
+
+func ioTaskB(req yu.Request) (ioB, error) {
+	if err := sleepCtx(req.Context, ioDelay); err != nil {
+		return ioB{}, err
+	}
+	return ioB{V: 2}, nil
+}
+
+func ioTaskC(req yu.Request) (ioC, error) {
+	if err := sleepCtx(req.Context, ioDelay); err != nil {
+		return ioC{}, err
+	}
+	return ioC{V: 3}, nil
+}
+
+func mergeIO(a ioA, b ioB, c ioC) yu.Response {
+	return yu.JSON(http.StatusOK, map[string]int{"sum": a.V + b.V + c.V})
+}
+
+// Tiny skills used to measure wave scheduling overhead.
+type (
+	tinyA struct{ V int }
+	tinyB struct{ V int }
+)
+
+func tinyTaskA(req yu.Request) tinyA { return tinyA{V: 1} }
+func tinyTaskB(req yu.Request) tinyB { return tinyB{V: 2} }
+
+func tinyMerge(a tinyA, b tinyB) yu.Response {
+	return yu.Text(http.StatusOK, "ok")
+}
+
+func mergeIO2(a ioA, b ioB) yu.Response {
+	return yu.JSON(http.StatusOK, map[string]int{"sum": a.V + b.V})
+}
+
 type framework struct {
 	name  string
 	build func(extraRoutes int) (baseURL string, stop func(), err error)
@@ -82,6 +146,7 @@ func frameworks() []framework {
 	return []framework{
 		{name: "stdlib", build: buildStdlib},
 		{name: "gin", build: buildGin},
+		{name: "gin-errgroup", build: buildGinErrgroup},
 		{name: "echo", build: buildEcho},
 		{name: "chi", build: buildChi},
 		{name: "fiber", build: buildFiber},
@@ -126,6 +191,10 @@ func buildStdlib(extraRoutes int) (string, func(), error) {
 	mux.HandleFunc("GET /compute", func(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, map[string]uint64{"sum": digest(11) + digest(22) + digest(33)})
 	})
+	mux.HandleFunc("GET /io", func(w http.ResponseWriter, req *http.Request) {
+		time.Sleep(3 * ioDelay)
+		writeJSON(w, map[string]int{"sum": 1 + 2 + 3})
+	})
 	for i := 0; i < extraRoutes; i++ {
 		mux.HandleFunc("GET "+fmt.Sprintf("/r%d", i), func(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -137,6 +206,14 @@ func buildStdlib(extraRoutes int) (string, func(), error) {
 }
 
 func buildGin(extraRoutes int) (string, func(), error) {
+	return buildGinVariant(extraRoutes, false)
+}
+
+func buildGinErrgroup(extraRoutes int) (string, func(), error) {
+	return buildGinVariant(extraRoutes, true)
+}
+
+func buildGinVariant(extraRoutes int, concurrent bool) (string, func(), error) {
 	r := gin.New()
 
 	r.GET("/ping", func(c *gin.Context) {
@@ -154,9 +231,41 @@ func buildGin(extraRoutes int) (string, func(), error) {
 		}
 		c.JSON(http.StatusOK, userResponse{ID: "1", Name: in.Name})
 	})
-	r.GET("/compute", func(c *gin.Context) {
-		c.JSON(http.StatusOK, map[string]uint64{"sum": digest(11) + digest(22) + digest(33)})
-	})
+
+	if concurrent {
+		r.GET("/compute", func(c *gin.Context) {
+			var eg errgroup.Group
+			var a, b, cc uint64
+			eg.Go(func() error { a = digest(11); return nil })
+			eg.Go(func() error { b = digest(22); return nil })
+			eg.Go(func() error { cc = digest(33); return nil })
+			if err := eg.Wait(); err != nil {
+				_ = c.Error(err)
+				return
+			}
+			c.JSON(http.StatusOK, map[string]uint64{"sum": a + b + cc})
+		})
+		r.GET("/io", func(c *gin.Context) {
+			var eg errgroup.Group
+			eg.Go(func() error { time.Sleep(ioDelay); return nil })
+			eg.Go(func() error { time.Sleep(ioDelay); return nil })
+			eg.Go(func() error { time.Sleep(ioDelay); return nil })
+			if err := eg.Wait(); err != nil {
+				_ = c.Error(err)
+				return
+			}
+			c.JSON(http.StatusOK, map[string]int{"sum": 1 + 2 + 3})
+		})
+	} else {
+		r.GET("/compute", func(c *gin.Context) {
+			c.JSON(http.StatusOK, map[string]uint64{"sum": digest(11) + digest(22) + digest(33)})
+		})
+		r.GET("/io", func(c *gin.Context) {
+			time.Sleep(3 * ioDelay)
+			c.JSON(http.StatusOK, map[string]int{"sum": 1 + 2 + 3})
+		})
+	}
+
 	for i := 0; i < extraRoutes; i++ {
 		r.GET(fmt.Sprintf("/r%d", i), func(c *gin.Context) {
 			c.String(http.StatusOK, "ok")
@@ -187,6 +296,10 @@ func buildEcho(extraRoutes int) (string, func(), error) {
 	})
 	e.GET("/compute", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]uint64{"sum": digest(11) + digest(22) + digest(33)})
+	})
+	e.GET("/io", func(c echo.Context) error {
+		time.Sleep(3 * ioDelay)
+		return c.JSON(http.StatusOK, map[string]int{"sum": 1 + 2 + 3})
 	})
 	for i := 0; i < extraRoutes; i++ {
 		e.GET(fmt.Sprintf("/r%d", i), func(c echo.Context) error {
@@ -219,6 +332,10 @@ func buildChi(extraRoutes int) (string, func(), error) {
 	r.Get("/compute", func(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, map[string]uint64{"sum": digest(11) + digest(22) + digest(33)})
 	})
+	r.Get("/io", func(w http.ResponseWriter, req *http.Request) {
+		time.Sleep(3 * ioDelay)
+		writeJSON(w, map[string]int{"sum": 1 + 2 + 3})
+	})
 	for i := 0; i < extraRoutes; i++ {
 		r.Get(fmt.Sprintf("/r%d", i), func(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -248,6 +365,10 @@ func buildFiber(extraRoutes int) (string, func(), error) {
 	})
 	app.Get("/compute", func(c *fiber.Ctx) error {
 		return c.JSON(map[string]uint64{"sum": digest(11) + digest(22) + digest(33)})
+	})
+	app.Get("/io", func(c *fiber.Ctx) error {
+		time.Sleep(3 * ioDelay)
+		return c.JSON(map[string]int{"sum": 1 + 2 + 3})
 	})
 	for i := 0; i < extraRoutes; i++ {
 		app.Get(fmt.Sprintf("/r%d", i), func(c *fiber.Ctx) error {
@@ -281,6 +402,7 @@ func buildYu(extraRoutes int) (string, func(), error) {
 		return yu.JSON(200, userResponse{ID: "1", Name: in.Name})
 	})
 	engine.GET("/compute", taskA, taskB, taskC, mergeDigests)
+	engine.GET("/io", ioTaskA, ioTaskB, ioTaskC, mergeIO)
 	for i := 0; i < extraRoutes; i++ {
 		engine.GET(fmt.Sprintf("/r%d", i), func(req yu.Request) yu.Response {
 			return yu.Text(200, "ok")
@@ -424,6 +546,69 @@ func BenchmarkFanoutLatency(b *testing.B) {
 	benchmarkAllSequential(b, http.MethodGet, "/compute", nil, 0)
 }
 
+func BenchmarkIOFanout(b *testing.B) {
+	benchmarkAll(b, http.MethodGet, "/io", nil, 0)
+}
+
+// BenchmarkIOFanoutLatency measures an I/O-bound fan-out with one client and
+// reports p50/p99. Sequential implementations sleep three times; errgroup,
+// hand-written Gin concurrency, and Yu overlap the three downstream calls.
+func BenchmarkIOFanoutLatency(b *testing.B) {
+	benchmarkLatencyDistribution(b, http.MethodGet, "/io")
+}
+
+func percentile(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(math.Ceil(p/100*float64(len(sorted)))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+func benchmarkLatencyDistribution(b *testing.B, method, path string) {
+	for _, fw := range frameworks() {
+		fw := fw
+		b.Run(fw.name, func(b *testing.B) {
+			baseURL, stop, err := fw.build(0)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer stop()
+
+			client := newClient()
+			defer client.CloseIdleConnections()
+			url := baseURL + path
+
+			for i := 0; i < 10; i++ {
+				if err := doRequest(client, method, url, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			durations := make([]time.Duration, 0, b.N)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				start := time.Now()
+				if err := doRequest(client, method, url, nil); err != nil {
+					b.Fatal(err)
+				}
+				durations = append(durations, time.Since(start))
+			}
+			b.StopTimer()
+
+			sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+			b.ReportMetric(float64(percentile(durations, 50))/float64(time.Microsecond), "p50-us")
+			b.ReportMetric(float64(percentile(durations, 99))/float64(time.Microsecond), "p99-us")
+		})
+	}
+}
+
 func BenchmarkManyRoutes(b *testing.B) {
 	benchmarkAll(b, http.MethodGet, fmt.Sprintf("/r%d", manyRoutes-1), nil, manyRoutes)
 }
@@ -480,6 +665,58 @@ func BenchmarkDigest(b *testing.B) {
 		acc = digest(11)
 	}
 	benchSink = acc
+}
+
+// BenchmarkYuTinyWave compares parallel and inlined execution for a wave of
+// two CPU-trivial skills.
+func BenchmarkYuTinyWave(b *testing.B) {
+	for _, mode := range []struct {
+		name  string
+		limit int
+	}{
+		{name: "parallel", limit: 1},
+		{name: "inline", limit: 2},
+	} {
+		mode := mode
+		b.Run(mode.name, func(b *testing.B) {
+			dag := yu.CompileDAG("GET-/tiny", nil, tinyTaskA, tinyTaskB, tinyMerge)
+			dag.SetInlineWaveLimit(mode.limit)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := dag.Run(context.Background(), nil, yu.Request{}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkYuIOWave shows the same trade-off for a latency-bound wave: inlining
+// serializes two 2 ms calls, while parallel execution overlaps them.
+func BenchmarkYuIOWave(b *testing.B) {
+	for _, mode := range []struct {
+		name  string
+		limit int
+	}{
+		{name: "parallel", limit: 1},
+		{name: "inline", limit: 2},
+	} {
+		mode := mode
+		b.Run(mode.name, func(b *testing.B) {
+			dag := yu.CompileDAG("GET-/io2", nil, ioTaskA, ioTaskB, mergeIO2)
+			dag.SetInlineWaveLimit(mode.limit)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := dag.Run(context.Background(), nil, yu.Request{}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func TestMain(m *testing.M) {

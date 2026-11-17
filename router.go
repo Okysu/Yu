@@ -12,6 +12,7 @@ type routeEntry struct {
 	timeout   time.Duration
 	bodyLimit int64
 	internal  bool
+	parts     []string // parsed pattern, computed once at registration
 }
 
 type router struct {
@@ -58,6 +59,7 @@ func (r *router) addRoute(method string, pattern string, entry *routeEntry) {
 	}
 
 	leaf := root.insert(pattern, parts, 0)
+	entry.parts = parts
 	leaf.entry = entry
 	r.entries[key] = entry
 }
@@ -75,22 +77,31 @@ func (r *router) getRoute(method string, path string) (*routeEntry, map[string]s
 		return nil, nil
 	}
 
-	params := make(map[string]string)
-	for index, part := range parsePattern(n.pattern) {
+	// Static routes keep params nil; the map is allocated only when the
+	// matched pattern actually contains a wildcard.
+	entry := n.entry
+	var params map[string]string
+	for index, part := range entry.parts {
 		if index >= len(searchParts) {
 			break
 		}
 		switch part[0] {
 		case ':':
+			if params == nil {
+				params = make(map[string]string, 2)
+			}
 			params[part[1:]] = searchParts[index]
 		case '*':
+			if params == nil {
+				params = make(map[string]string, 1)
+			}
 			if len(part) > 1 {
 				params[part[1:]] = strings.Join(searchParts[index:], "/")
 			}
-			return n.entry, params
+			return entry, params
 		}
 	}
-	return n.entry, params
+	return entry, params
 }
 
 // allowedMethods returns the sorted methods that have a route matching path.

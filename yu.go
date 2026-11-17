@@ -154,6 +154,10 @@ func (engine *Engine) addRoute(method, pattern string, items ...any) {
 	}
 
 	dag := CompileDAG(key, engine.singletons, skillFuncs...)
+	if cfg.inlineWaveLimit > 0 {
+		dag.SetInlineWaveLimit(cfg.inlineWaveLimit)
+	}
+
 	var scheduler *PartitionScheduler
 	modeDesc := "Lock-Free Parallel"
 	if cfg.keyFn != nil {
@@ -206,11 +210,17 @@ func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// Parse the query string only when one is present.
+	var query map[string][]string
+	if req.URL.RawQuery != "" {
+		query = req.URL.Query()
+	}
+
 	frozenReq := Request{
 		Method:     req.Method,
 		Path:       req.URL.Path,
 		RawQuery:   req.URL.RawQuery,
-		query:      req.URL.Query(),
+		query:      query,
 		params:     params,
 		header:     req.Header.Clone(),
 		body:       bodyBytes,

@@ -153,6 +153,7 @@ Containers are private and exposed only through read-only accessors, so skills i
 |---|---|
 | `yu.WithTimeout(d)` | Per-route timeout; returns 504 when exceeded |
 | `yu.WithBodyLimit(n)` | Request body cap; returns 413 when exceeded (unlimited by default) |
+| `yu.WithInlineWaveLimit(n)` | Runs waves with at most `n` skills sequentially with no goroutines (default `1`, single-node only) |
 | `yu.PartitionBy(keyFn, workers...)` | Sharded serial scheduling, 32 lanes by default |
 
 Match precedence: static segment > `:param` > `*catch-all`. Trailing slashes are ignored; two different wildcards at the same position are rejected. A known path with the wrong method returns 405 with an `Allow` header, otherwise 404.

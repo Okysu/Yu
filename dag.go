@@ -25,6 +25,8 @@ type FuncNode struct {
 	Fn       reflect.Value
 	InTypes  []reflect.Type
 	OutTypes []reflect.Type
+
+	argsPool sync.Pool // recycles []reflect.Value argument slices per node
 }
 
 // CompiledDAG is the startup-compiled execution plan of a route.
@@ -38,6 +40,41 @@ type CompiledDAG struct {
 	RouteKey string
 	Nodes    []*FuncNode
 	Waves    [][]*FuncNode // Execution waves for parallel scheduling
+
+	blackboards *blackboardPool
+	// inlineWaveLimit runs waves with at most this many nodes sequentially.
+	// The default (and minimum when unset) is 1, which only affects the
+	// single-node fast path. Raising it trades parallelism for less
+	// goroutine/scheduling overhead on tiny waves.
+	inlineWaveLimit int
+}
+
+// blackboard holds the per-request type-keyed values passed between skills.
+// Instances are pooled per DAG; values are cleared when returned.
+type blackboard struct {
+	values map[reflect.Type]reflect.Value
+}
+
+type blackboardPool struct {
+	pool sync.Pool
+}
+
+func newBlackboardPool(size int) *blackboardPool {
+	p := &blackboardPool{}
+	p.pool.New = func() any {
+		return &blackboard{values: make(map[reflect.Type]reflect.Value, size)}
+	}
+	return p
+}
+
+func (p *blackboardPool) get() *blackboard {
+	return p.pool.Get().(*blackboard)
+}
+
+func (p *blackboardPool) put(b *blackboard) {
+	// Drop references so pooled maps do not retain request bodies or outputs.
+	clear(b.values)
+	p.pool.Put(b)
 }
 
 // CompileDAG compiles a DAG into a CompiledDAG.
@@ -120,12 +157,17 @@ func CompileDAG(routeKey string, singletons map[reflect.Type]reflect.Value, rawF
 			producers[out] = name
 		}
 
-		nodes = append(nodes, &FuncNode{
+		node := &FuncNode{
 			Name:     name,
 			Fn:       v,
 			InTypes:  inTypes,
 			OutTypes: outTypes,
-		})
+		}
+		node.argsPool.New = func() any {
+			args := make([]reflect.Value, len(node.InTypes))
+			return &args
+		}
+		nodes = append(nodes, node)
 	}
 
 	if responseProducers == 0 {
@@ -202,10 +244,23 @@ func CompileDAG(routeKey string, singletons map[reflect.Type]reflect.Value, rawF
 	}
 
 	return &CompiledDAG{
-		RouteKey: routeKey,
-		Nodes:    nodes,
-		Waves:    waves,
+		RouteKey:        routeKey,
+		Nodes:           nodes,
+		Waves:           waves,
+		blackboards:     newBlackboardPool(len(singletons) + len(nodes) + 2),
+		inlineWaveLimit: 1,
 	}
+}
+
+// SetInlineWaveLimit runs waves containing at most n skills sequentially
+// instead of spawning goroutines. It must be called before the DAG is used
+// concurrently. Values below 1 are treated as 1 (only single-node waves are
+// inlined).
+func (dag *CompiledDAG) SetInlineWaveLimit(n int) {
+	if n < 1 {
+		n = 1
+	}
+	dag.inlineWaveLimit = n
 }
 
 // Run executes the compiled DAG for a single request using concurrent wave scheduling,
@@ -218,12 +273,33 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 	// so skills can propagate it downstream to database or HTTP clients.
 	req.Context = ctx
 
-	blackboard := make(map[reflect.Type]reflect.Value, len(singletons)+len(dag.Nodes)+2)
+	var blackboard map[reflect.Type]reflect.Value
+
+	// keepBoard is set when returning while wave goroutines may still read the
+	// map; such a board is dropped instead of being cleared and pooled.
+	keepBoard := false
+	if dag.blackboards != nil {
+		board := dag.blackboards.get()
+		defer func() {
+			if !keepBoard {
+				dag.blackboards.put(board)
+			}
+		}()
+		blackboard = board.values
+	} else {
+		blackboard = make(map[reflect.Type]reflect.Value, len(singletons)+len(dag.Nodes)+2)
+	}
+
 	for k, v := range singletons {
 		blackboard[k] = v
 	}
 	blackboard[reqType] = reflect.ValueOf(req)
 	blackboard[ctxType] = reflect.ValueOf(ctx)
+
+	inlineLimit := dag.inlineWaveLimit
+	if inlineLimit < 1 {
+		inlineLimit = 1
+	}
 
 	for _, wave := range dag.Waves {
 		// Check for request timeout or client disconnection before entering the next wave.
@@ -231,34 +307,36 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 			return Response{}, mapContextErr(err)
 		}
 
-		// Fast path for single-node waves.
-		if len(wave) == 1 {
-			n := wave[0]
-
-			args, err := buildArgs(n, blackboard)
-			if err != nil {
-				return Response{}, err
-			}
-			outs, err := safeCall(n, args)
-			if err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return Response{}, mapContextErr(ctxErr)
+		// Sequential path: single-node waves and any wave explicitly capped by
+		// WithInlineWaveLimit. No goroutine is started for these.
+		if len(wave) <= inlineLimit {
+			for _, n := range wave {
+				args, err := n.acquireArgs(blackboard)
+				if err != nil {
+					return Response{}, err
 				}
-				return Response{}, err
-			}
-			if resp, ok := absorbOutputs(outs, blackboard); ok {
-				return resp, nil
-			}
-			// A context-aware skill may answer cancellation with a zero
-			// Response; report that as a timeout rather than as a pipeline
-			// that finished without a response.
-			if err := ctx.Err(); err != nil {
-				return Response{}, mapContextErr(err)
+				outs, err := safeCall(n, *args)
+				n.releaseArgs(args)
+				if err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return Response{}, mapContextErr(ctxErr)
+					}
+					return Response{}, err
+				}
+				if resp, ok := absorbOutputs(outs, blackboard); ok {
+					return resp, nil
+				}
+				// A context-aware skill may answer cancellation with a zero
+				// Response; report that as a timeout rather than as a pipeline
+				// that finished without a response.
+				if err := ctx.Err(); err != nil {
+					return Response{}, mapContextErr(err)
+				}
 			}
 			continue
 		}
 
-		// Concurrent execution path for multi-node waves.
+		// Concurrent path.
 		type nodeResult struct {
 			outs []reflect.Value
 			err  error
@@ -270,27 +348,29 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 		for idx, node := range wave {
 			go func(i int, n *FuncNode) {
 				defer wg.Done()
-				args, err := buildArgs(n, blackboard)
+				args, err := n.acquireArgs(blackboard)
 				if err != nil {
 					results[i] = nodeResult{err: err}
 					return
 				}
 				// Guard each child goroutine with safeCall to capture panics and errors.
-				outs, callErr := safeCall(n, args)
+				outs, callErr := safeCall(n, *args)
+				n.releaseArgs(args)
 				results[i] = nodeResult{outs: outs, err: callErr}
 			}(idx, node)
 		}
 
-		// Wait for all child goroutines in this wave to complete, or abort early on cancellation/timeout.
 		doneCh := make(chan struct{})
 		go func() {
 			wg.Wait()
 			close(doneCh)
 		}()
 
+		// Wait for every node in this wave, or abort early on cancellation/timeout.
 		select {
 		case <-doneCh:
 		case <-ctx.Done():
+			keepBoard = true
 			cancel()
 			return Response{}, mapContextErr(ctx.Err())
 		}
@@ -321,17 +401,32 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 	return Response{}, fmt.Errorf("yu: pipeline finished without producing Response")
 }
 
-// buildArgs resolves the blackboard values for a skill's declared inputs.
-func buildArgs(n *FuncNode, blackboard map[reflect.Type]reflect.Value) ([]reflect.Value, error) {
-	args := make([]reflect.Value, len(n.InTypes))
+// acquireArgs fills a pooled argument slice for the node's declared inputs.
+func (n *FuncNode) acquireArgs(blackboard map[reflect.Type]reflect.Value) (*[]reflect.Value, error) {
+	argsPtr := n.argsPool.Get().(*[]reflect.Value)
+	args := *argsPtr
+	if len(args) != len(n.InTypes) {
+		args = make([]reflect.Value, len(n.InTypes))
+		*argsPtr = args
+	}
+
 	for i, inType := range n.InTypes {
 		v, ok := blackboard[inType]
 		if !ok {
+			n.releaseArgs(argsPtr)
 			return nil, fmt.Errorf("yu: missing dependency %v for skill [%s]", inType, n.Name)
 		}
 		args[i] = v
 	}
-	return args, nil
+	return argsPtr, nil
+}
+
+// releaseArgs clears references and returns the slice to the node's pool.
+func (n *FuncNode) releaseArgs(argsPtr *[]reflect.Value) {
+	for i := range *argsPtr {
+		(*argsPtr)[i] = reflect.Value{}
+	}
+	n.argsPool.Put(argsPtr)
 }
 
 // absorbOutputs records non-Response outputs on the blackboard and reports a

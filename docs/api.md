@@ -145,6 +145,12 @@ func PartitionBy(keyFn PartitionKeyFunc, workers ...int) RouteOption
 | `WithTimeout` | no timeout | Derives a deadline context; expiry returns `504`. |
 | `WithBodyLimit` | unlimited | Rejects larger bodies with `413` before running skills. `<= 0` disables the limit. |
 | `PartitionBy` | off | Serializes same-key requests through one of `workers` lanes (default `32`). |
+| `WithInlineWaveLimit(n)` | `1` | Runs waves containing at most `n` skills sequentially, starting no goroutines. |
+
+`WithInlineWaveLimit` trades parallelism for scheduling overhead. The default
+of `1` only affects the single-node fast path. Raise it for CPU-trivial waves;
+do not raise it when a small wave contains I/O, because those calls would be
+serialized.
 
 ## Partitioning
 
@@ -198,6 +204,8 @@ func (dag *CompiledDAG) Run(
 	singletons map[reflect.Type]reflect.Value,
 	req Request,
 ) (Response, error)
+
+func (dag *CompiledDAG) SetInlineWaveLimit(n int)
 ```
 
 `CompileDAG` is the low-level compiler used by route registration. It panics on
@@ -206,6 +214,10 @@ invalid graphs; `Run` recovers skill panics and maps deadline expiry to
 
 `Waves` is the execution plan: skills within a wave are safe to run
 concurrently; later waves consume earlier outputs.
+
+`SetInlineWaveLimit` runs waves with at most `n` skills sequentially. It must be
+called before the DAG is used concurrently; values below `1` are treated as `1`.
+The route-level equivalent is `WithInlineWaveLimit`.
 
 ## Errors
 

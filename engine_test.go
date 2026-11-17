@@ -5,13 +5,19 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type engineGroupUser struct{ Name string }
 type engineSvc struct{ Name string }
+type enginePairA struct{}
+type enginePairB struct{}
+type engineIDValue struct{ ID string }
 
 func serve(e *Engine, method, target string, body io.Reader) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
@@ -290,4 +296,80 @@ func TestEngineProvideRejectsTypedNil(t *testing.T) {
 	expectPanic(t, func() {
 		e.Provide(svc)
 	})
+}
+
+// trackActive records the peak number of concurrently running skills.
+func trackActive(active, peak *int32) {
+	n := atomic.AddInt32(active, 1)
+	for {
+		p := atomic.LoadInt32(peak)
+		if n <= p || atomic.CompareAndSwapInt32(peak, p, n) {
+			break
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	atomic.AddInt32(active, -1)
+}
+
+func TestEngineInlineWaveLimit(t *testing.T) {
+	t.Run("parallel by default", func(t *testing.T) {
+		var active, peak int32
+		e := New()
+		e.GET("/pair",
+			func(req Request) enginePairA { trackActive(&active, &peak); return enginePairA{} },
+			func(req Request) enginePairB { trackActive(&active, &peak); return enginePairB{} },
+			func(enginePairA, enginePairB) Response { return Text(200, "ok") },
+		)
+
+		if w := serve(e, "GET", "/pair", nil); w.Code != http.StatusOK {
+			t.Fatalf("status = %d", w.Code)
+		}
+		if peak != 2 {
+			t.Fatalf("peak concurrency = %d, want 2", peak)
+		}
+	})
+
+	t.Run("inlined wave", func(t *testing.T) {
+		var active, peak int32
+		e := New()
+		e.GET("/pair", WithInlineWaveLimit(2),
+			func(req Request) enginePairA { trackActive(&active, &peak); return enginePairA{} },
+			func(req Request) enginePairB { trackActive(&active, &peak); return enginePairB{} },
+			func(enginePairA, enginePairB) Response { return Text(200, "ok") },
+		)
+
+		if w := serve(e, "GET", "/pair", nil); w.Code != http.StatusOK {
+			t.Fatalf("status = %d", w.Code)
+		}
+		if peak != 1 {
+			t.Fatalf("peak concurrency = %d, want 1", peak)
+		}
+
+		entry := e.router.entries["GET-/pair"]
+		if entry == nil || entry.dag.inlineWaveLimit != 2 {
+			t.Fatalf("inlineWaveLimit not applied")
+		}
+	})
+}
+
+func TestEngineConcurrentRequestsAreIsolated(t *testing.T) {
+	e := New()
+	e.GET("/id/:id",
+		func(req Request) engineIDValue { return engineIDValue{ID: req.Param("id")} },
+		func(v engineIDValue) Response { return Text(200, v.ID) },
+	)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			e.ServeHTTP(w, httptest.NewRequest("GET", "/id/"+id, nil))
+			if w.Code != http.StatusOK || w.Body.String() != id {
+				t.Errorf("id %s got %d %q", id, w.Code, w.Body.String())
+			}
+		}(strconv.Itoa(i))
+	}
+	wg.Wait()
 }
