@@ -15,6 +15,16 @@ You write only lock-free pure functions — atomic skills. Hand them to a route 
 - A panicking skill only fails the current request; it never takes down the process or a shard lane
 - Startup compilation: ambiguous causality, unreachable dependencies and illegal signatures fail fast
 
+## Why "Yu"
+
+Yu is named after Yu the Great (大禹), who controlled the great flood not by
+building dams but by dredging channels and letting the water find its own way.
+The framework follows the same principle: instead of blocking concurrency with
+middleware, locks and glue code, it expresses causality in Go types and lets
+the engine compile a topology at startup.
+
+> Guide, don't block. Let causality drive itself. — Yu
+
 Requires Go 1.26+.
 
 ## Install
