@@ -133,7 +133,14 @@ func NewPartitionScheduler(workers int, keyFn PartitionKeyFunc) *PartitionSchedu
 func (ps *PartitionScheduler) laneFor(key string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
-	return int(h.Sum32()) % len(ps.lanes)
+	return laneIndex(h.Sum32(), len(ps.lanes))
+}
+
+// laneIndex reduces a uint32 hash in unsigned space. Converting the hash to
+// int first would produce a negative index on 32-bit platforms for hashes with
+// the high bit set.
+func laneIndex(h uint32, lanes int) int {
+	return int(h % uint32(lanes))
 }
 
 // Dispatch routes a request to its designated worker queue based on the hashed key

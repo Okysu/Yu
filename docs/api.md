@@ -142,7 +142,7 @@ func PartitionBy(keyFn PartitionKeyFunc, workers ...int) RouteOption
 
 | Option | Default | Behavior |
 |---|---|---|
-| `WithTimeout` | no timeout | Derives a deadline context; expiry returns `504`. |
+| `WithTimeout` | no timeout | Derives a deadline context; expiry returns `504`. Cancellation is cooperative; see [advanced](advanced.md#timeouts-and-cancellation). |
 | `WithBodyLimit` | unlimited | Rejects larger bodies with `413` before running skills. `<= 0` disables the limit. |
 | `PartitionBy` | off | Serializes same-key requests through one of `workers` lanes (default `32`). |
 | `WithInlineWaveLimit(n)` | `1` | Runs waves containing at most `n` skills sequentially, starting no goroutines. |

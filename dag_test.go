@@ -14,6 +14,7 @@ type dagA struct{ V int }
 type dagB struct{ V int }
 type dagC struct{ V int }
 type dagDep struct{ Name string }
+type dagSingleton struct{}
 
 func dagSkillA(req Request) dagA                            { return dagA{V: 1} }
 func dagSkillA2(req Request) dagA                           { return dagA{V: 2} }
@@ -57,6 +58,32 @@ func dagSkillHasDeadline(req Request) Response {
 
 func dagSkillErr(req Request) (Response, error) {
 	return Response{}, errors.New("skill failed")
+}
+
+func dagSkillReturnsRequest(req Request) (Request, Response) {
+	return req, Text(200, "shadowed")
+}
+
+func dagSkillReturnsContext(req Request) (context.Context, Response) {
+	return req.Context, Text(200, "shadowed")
+}
+
+func dagSkillReturnsSingleton(req Request) (dagSingleton, Response) {
+	return dagSingleton{}, Text(200, "shadowed")
+}
+
+func expectPanicContains(t *testing.T, substr string, fn func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected a panic containing %q", substr)
+		}
+		if msg, ok := r.(string); !ok || !strings.Contains(msg, substr) {
+			t.Fatalf("panic = %v, want a message containing %q", r, substr)
+		}
+	}()
+	fn()
 }
 
 func expectPanic(t *testing.T, fn func()) {
@@ -180,6 +207,28 @@ func TestCompileRejectsMisplacedError(t *testing.T) {
 func TestCompileRejectsResponseAsInput(t *testing.T) {
 	expectPanic(t, func() {
 		CompileDAG("GET-/w", nil, dagSkillResp1, dagSkillNeedsResponse)
+	})
+}
+
+func TestCompileRejectsShadowingRequest(t *testing.T) {
+	expectPanicContains(t, "yu.Request", func() {
+		CompileDAG("GET-/w", nil, dagSkillReturnsRequest)
+	})
+}
+
+func TestCompileRejectsShadowingContext(t *testing.T) {
+	expectPanicContains(t, "context.Context", func() {
+		CompileDAG("GET-/w", nil, dagSkillReturnsContext)
+	})
+}
+
+func TestCompileRejectsShadowingSingleton(t *testing.T) {
+	singletons := map[reflect.Type]reflect.Value{
+		reflect.TypeOf(dagSingleton{}): reflect.ValueOf(dagSingleton{}),
+	}
+
+	expectPanicContains(t, "singleton", func() {
+		CompileDAG("GET-/w", singletons, dagSkillReturnsSingleton)
 	})
 }
 

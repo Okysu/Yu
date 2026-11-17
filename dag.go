@@ -149,6 +149,21 @@ func CompileDAG(routeKey string, singletons map[reflect.Type]reflect.Value, rawF
 				responseProducers++
 				continue
 			}
+			if out == reqType {
+				panic(fmt.Sprintf(
+					"yu: route [%s] node #%d [%s] produces yu.Request; request data is already provided and cannot be shadowed",
+					routeKey, i, name))
+			}
+			if out == ctxType {
+				panic(fmt.Sprintf(
+					"yu: route [%s] node #%d [%s] produces context.Context; the request context is already provided and cannot be shadowed",
+					routeKey, i, name))
+			}
+			if _, isSingleton := singletons[out]; isSingleton {
+				panic(fmt.Sprintf(
+					"yu: route [%s] node #%d [%s] produces %v, which collides with a provided singleton",
+					routeKey, i, name, out))
+			}
 			if prev, ok := producers[out]; ok {
 				panic(fmt.Sprintf(
 					"yu: route [%s] output type %v is produced by both [%s] and [%s]; a type has exactly one producer — declare a distinct type for a refined value",

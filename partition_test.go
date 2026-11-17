@@ -162,6 +162,29 @@ func TestPartitionSchedulerLaneSurvivesPanic(t *testing.T) {
 	}
 }
 
+func TestLaneIndexUsesUnsignedReduction(t *testing.T) {
+	// On 32-bit platforms int(^uint32(0)) is -1, which modulo 32 yields -1.
+	// The reduction must stay in uint32 space.
+	if got := laneIndex(^uint32(0), 32); got != 31 {
+		t.Fatalf("laneIndex(max uint32, 32) = %d, want 31", got)
+	}
+	if got := laneIndex(1<<31, 32); got != 0 {
+		t.Fatalf("laneIndex(1<<31, 32) = %d, want 0", got)
+	}
+}
+
+func TestPartitionSchedulerLaneIndexInRange(t *testing.T) {
+	ps := NewPartitionScheduler(32, func(Request) string { return "" })
+
+	for i := 0; i < 10000; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		lane := ps.laneFor(key)
+		if lane < 0 || lane >= len(ps.lanes) {
+			t.Fatalf("laneFor(%q) = %d, want [0, %d)", key, lane, len(ps.lanes))
+		}
+	}
+}
+
 func TestPartitionSchedulerDefaultsWorkers(t *testing.T) {
 	ps := NewPartitionScheduler(0, func(Request) string { return "k" })
 

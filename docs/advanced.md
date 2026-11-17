@@ -3,6 +3,35 @@
 This page covers the rules that make the DAG deterministic and the patterns
 that follow from them.
 
+## Execution semantics and their limits
+
+Three rules explain most surprises:
+
+1. **A wave is a barrier.** Values, errors and responses produced in a wave are
+   inspected only after every skill in that wave has finished. If one skill
+   fails, its siblings have already run. Cancellation only stops work that
+   observes the context.
+2. **Ordering comes from types, not registration.** A guard that only takes
+   `yu.Request` lands in the same wave as any business skill that also only
+   takes `yu.Request`. A 401 from the guard does not prevent the business skill
+   from executing. Make the business skill consume a capability the guard
+   produces:
+
+   ```go
+   type AuthUser struct{ ID string }
+
+   func authenticate(req yu.Request) (AuthUser, error)       // wave 0
+   func loadItems(req yu.Request, u AuthUser) ([]Item, error) // wave 1
+   ```
+
+   If authentication fails, the route stops before `loadItems` runs. Group
+   nodes are ordinary DAG nodes; they are not middleware and add no barrier.
+3. **Cancellation is cooperative.** A timeout or client disconnect closes the
+   context; the engine observes it between waves and while waiting for a
+   multi-node wave. It cannot preempt a running Go function, and it does not
+   roll back side effects from waves that already completed. See
+   [Timeouts and cancellation](#timeouts-and-cancellation).
+
 ## Causality is type identity
 
 The engine keys the blackboard by Go type. That gives three rules:
@@ -115,12 +144,24 @@ func slowQuery(ctx context.Context, req yu.Request) (Rows, error) {
 engine.GET("/report/:id", yu.WithTimeout(500*time.Millisecond), slowQuery, render)
 ```
 
-When the deadline expires, in-flight waves are cancelled and the client
-receives `504 Gateway Timeout`. A skill that answers cancellation with a zero
-`yu.Response` is still reported as a timeout, not as an empty pipeline.
+Cancellation is cooperative, and wave shape matters:
 
-If the client disconnects, the request context is cancelled and the pipeline
-returns as soon as it reaches a cancellation point.
+- While a multi-node wave runs, the engine waits on both completion and the
+  context. The client receives `504` at the deadline; sibling goroutines that
+  ignore the context keep running until they finish.
+- Single-node waves (and any wave inlined with `WithInlineWaveLimit`) run
+  synchronously on the request goroutine. If the skill ignores the context, the
+  response is delayed until it returns; the timeout is reported only then.
+  Timed routes are not preempted mid-skill.
+- Abandoned goroutines cannot be killed. Skills that perform I/O must watch
+  `req.Context` or take `context.Context` directly.
+- Completed waves are not rolled back. If a write must not survive a timeout,
+  use a transaction or check the context before committing.
+- A client disconnect cancels the request context; the pipeline returns at the
+  next cancellation point.
+
+A skill that answers cancellation with a zero `yu.Response` is still reported
+as a timeout, not as an empty pipeline.
 
 ## Request body limits
 

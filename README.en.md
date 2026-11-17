@@ -201,6 +201,7 @@ benchmarks/   comparison harness as a separate module
 ## Design constraints
 
 - Skills must be pure: do not mutate `Request`, singletons or upstream values. The framework keeps containers read-only, but object state is your responsibility.
+- A wave is a barrier: errors and `Response` values from a wave are applied only after every skill in it finishes. One failing skill does not prevent its siblings from running. Cancellation is cooperative: it cannot preempt a running function or roll back completed side effects.
 - Skill panics are recovered and logged server-side; clients only receive a 500 without internal details.
 - When one value needs to be refined in stages, declare distinct types:
 
