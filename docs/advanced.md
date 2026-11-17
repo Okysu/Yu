@@ -7,10 +7,11 @@ that follow from them.
 
 Three rules explain most surprises:
 
-1. **A wave is a barrier.** Values, errors and responses produced in a wave are
-   inspected only after every skill in that wave has finished. If one skill
-   fails, its siblings have already run. Cancellation only stops work that
-   observes the context.
+1. **A concurrent wave fails fast, but cannot roll back.** The first skill in a
+   wave that returns an error or a non-zero `Response` cancels the wave and the
+   request returns without waiting for the slowest sibling. Siblings already
+   running are only stopped if they observe the context. Single-node and
+   inlined waves run sequentially, so nothing is cancelled mid-wave.
 2. **Ordering comes from types, not registration.** A guard that only takes
    `yu.Request` lands in the same wave as any business skill that also only
    takes `yu.Request`. A 401 from the guard does not prevent the business skill
@@ -130,6 +131,18 @@ The scheduler respects the request context both while a task waits in its lane
 queue and while it runs. A timeout is never stretched by a backlogged lane.
 Skill panics are recovered per task, so a shard worker never dies.
 
+Scheduler semantics worth knowing:
+
+- It is created **per route**. The same key on two different routes is not
+  mutually exclusive.
+- Lanes are hash buckets, not one queue per key. Different keys can map to the
+  same lane and queue behind each other; choose `workers` accordingly.
+- Each lane has a bounded queue (256). `Dispatch` blocks when it is full, or
+  returns early when the request context is cancelled.
+- `Engine.Close` closes every route scheduler. New dispatches return
+  `ErrSchedulerClosed` (`503` over HTTP); tasks already buffered are drained by
+  their workers before the lane exits.
+
 ## Timeouts and cancellation
 
 `WithTimeout` derives a context with a deadline and passes it to the pipeline.
@@ -146,13 +159,13 @@ engine.GET("/report/:id", yu.WithTimeout(500*time.Millisecond), slowQuery, rende
 
 Cancellation is cooperative, and wave shape matters:
 
-- While a multi-node wave runs, the engine waits on both completion and the
-  context. The client receives `504` at the deadline; sibling goroutines that
-  ignore the context keep running until they finish.
-- Single-node waves (and any wave inlined with `WithInlineWaveLimit`) run
-  synchronously on the request goroutine. If the skill ignores the context, the
-  response is delayed until it returns; the timeout is reported only then.
-  Timed routes are not preempted mid-skill.
+- While a concurrent wave runs, the engine waits on completion, the first
+  terminal signal, and the context. The client receives `504` at the deadline;
+  sibling goroutines that ignore the context keep running until they finish.
+- A single-node wave on a route with a deadline runs on its own goroutine and
+  is raced against the context, so the client receives `504` at the deadline
+  even if the skill ignores it. Waves inlined with
+  `WithInlineWaveLimit(2+)` remain synchronous and are not preempted.
 - Abandoned goroutines cannot be killed. Skills that perform I/O must watch
   `req.Context` or take `context.Context` directly.
 - Completed waves are not rolled back. If a write must not survive a timeout,
@@ -193,13 +206,65 @@ Rules:
 
 ## Errors and panics
 
-`error` must be the last return value. A non-nil error aborts the route and
-returns `500` to the client; the full error is written to the server log, not
-to the response body.
+`error` must be the last return value. A non-nil error aborts the route; by
+default it returns `500`, unless it is an `*HTTPError` (see below). The full
+error is written to the server log, not to the response body.
 
 A panic in a skill is recovered, logged with a stack trace, and converted into
 an error for that request only. Other requests, other waves and partition lanes
 are unaffected.
+
+Skills can fail with a status code instead of a bare 500:
+
+```go
+func validate(req yu.Request) (Input, error) {
+	if req.QueryDefault("token", "") == "" {
+		return Input{}, &yu.HTTPError{Status: 401, Err: errors.New("missing token")}
+	}
+	return Input{}, nil
+}
+```
+
+`ServeHTTP` maps `*HTTPError` to its status (400–599) and logs the wrapped
+error; the client receives only the status text. This changes the status code,
+not the ordering: a sibling in the same wave still runs unless it observes the
+cancelled context.
+
+## HTTP-layer middleware
+
+Cross-cutting concerns belong outside the engine. `*yu.Engine` implements
+`http.Handler`, so ordinary net/http middleware composes:
+
+```go
+handler := withAccessLog(withCORS(engine))
+http.ListenAndServe(":8080", handler)
+```
+
+CORS, compression, access logs and metrics all fit here; see
+[`examples/middleware`](../examples/middleware). The engine deliberately has no
+middleware concept inside the DAG: nodes are causal skills, not wrappers. A
+wrapper can observe the final status and headers, but it cannot reorder or
+cancel DAG nodes.
+
+## Graceful shutdown
+
+`Engine.Run` is a convenience wrapper around `http.ListenAndServe`, which has no
+shutdown handle. Run your own server when you need a controlled stop:
+
+```go
+srv := &http.Server{Addr: ":8080", Handler: engine}
+go func() { _ = srv.ListenAndServe() }()
+
+// On SIGTERM:
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+_ = srv.Shutdown(ctx)
+engine.Close()
+```
+
+`Engine.Close` stops accepting new partition dispatches and drains queued
+tasks; it does not interrupt in-flight requests. Call it after `Shutdown`
+returns.
 
 ## Testing
 
@@ -263,7 +328,8 @@ The default is `1`. The measured trade-off with two skills:
 
 Raise the limit only when the wave contains no I/O. The engine cannot infer
 cost at compile time, which is why serializing small waves is opt-in rather
-than a default.
+than a default. A single-node wave on a route with a deadline always uses the
+concurrent path so the timeout can fire.
 
 ## Performance notes
 

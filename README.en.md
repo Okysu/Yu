@@ -188,20 +188,22 @@ Open `/debug/dag` to inspect each route's compiled wave topology; `/debug/dag?fo
 ```
 yu.go         Engine, Request, Response, HTTP entry point
 dag.go        skill reflection, topological compilation, wave scheduling, panic/timeout handling
+http_error.go status-coded errors
 router.go     trie routing and route entries
 trie.go       route tree nodes
 group.go      route groups
 partition.go  sharded scheduler and route options
 debug.go      topology visualisation
 docs/         documentation: quickstart, advanced, API, benchmarks
-examples/     runnable examples
+examples/     runnable examples: quickstart, advanced, middleware
 benchmarks/   comparison harness as a separate module
 ```
 
 ## Design constraints
 
 - Skills must be pure: do not mutate `Request`, singletons or upstream values. The framework keeps containers read-only, but object state is your responsibility.
-- A wave is a barrier: errors and `Response` values from a wave are applied only after every skill in it finishes. One failing skill does not prevent its siblings from running. Cancellation is cooperative: it cannot preempt a running function or roll back completed side effects.
+- A concurrent wave fails fast: the first skill returning an error or a non-zero `Response` cancels its siblings and returns immediately. Cancellation is cooperative: it cannot preempt a running function or roll back side effects that already started. Single-node and inlined waves run sequentially.
+- Cross-cutting concerns (CORS, compression, access logs, metrics) live outside the engine: `*Engine` is an `http.Handler`, so standard net/http middleware composes around it.
 - Skill panics are recovered and logged server-side; clients only receive a 500 without internal details.
 - When one value needs to be refined in stages, declare distinct types:
 

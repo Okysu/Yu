@@ -94,7 +94,7 @@ server.
 | echo | 10,949 | 9,274 | 76 |
 | chi | 10,676 | 9,552 | 77 |
 | fiber | 9,567 | 6,060 | 54 |
-| **yu** | **12,509** | **11,956** | **95** |
+| **yu** | **12,220** | **11,848** | **95** |
 
 ### GetUser (path param + JSON)
 
@@ -130,7 +130,7 @@ server.
 | echo | 50,479 | 13,046 | 86 |
 | chi | 50,590 | 13,423 | 88 |
 | fiber | 43,319 | 9,269 | 65 |
-| **yu** | **55,466** | **17,847** | **130** |
+| **yu** | **56,379** | **18,090** | **131** |
 
 When every core is busy, parallelizing inside a request cannot reduce total CPU
 work. Yu and `gin-errgroup` pay scheduling and reflection overhead here; both
@@ -179,7 +179,7 @@ microseconds.
 | echo | 692,217 |
 | chi | 689,136 |
 | fiber | 691,152 |
-| **yu** | **331,294** |
+| **yu** | **332,173** |
 
 Three 219 µs tasks take ~656 µs sequentially. Yu's automatic wave execution and
 the hand-written `errgroup` version both cut latency to roughly a third, with no
@@ -197,10 +197,10 @@ Three simulated downstream calls, 2 ms each:
 | echo | 6,183,522 | 6,165 | 6,496 |
 | chi | 6,246,545 | 6,190 | 6,544 |
 | fiber | 6,169,392 | 6,153 | 6,409 |
-| **yu** | **2,219,580** | **2,194** | **2,549** |
+| **yu** | **2,227,229** | **2,202** | **2,528** |
 
 Yu and `gin-errgroup` are statistically indistinguishable at p50. Yu's p99 is
-about 120 µs higher in this run (2.55 ms vs 2.43 ms), consistent with the
+about 100 µs higher in this run (2.53 ms vs 2.43 ms), consistent with the
 additional per-request allocation and reflection work.
 
 ### I/O fanout throughput
@@ -213,7 +213,7 @@ additional per-request allocation and reflection work.
 | echo | 237,838 | 9,347 | 82 |
 | chi | 238,576 | 9,799 | 83 |
 | fiber | 239,012 | 6,481 | 61 |
-| **yu** | **98,138** | **16,196** | **137** |
+| **yu** | **98,405** | **16,187** | **138** |
 
 Under saturation, overlapping sleeps still wins because the waiting does not
 consume CPU: all three parallel variants are ~2.4× faster than the sequential
@@ -227,7 +227,7 @@ Measured directly on the DAG, without HTTP:
 |---|---:|---:|---:|
 | `Digest` (one task) | 218,945 | 0 | 0 |
 | `YuSequentialFanout` (three tasks, no engine) | 656,400 | 0 | 0 |
-| `YuDAGFanout` (three-task wave + merge + JSON) | 231,414 | 2,141 | 34 |
+| `YuDAGFanout` (three-task wave + merge + JSON) | 232,791 | 2,197 | 35 |
 | `YuCompile` (single-skill route) | ~318 | 376 | 11 |
 
 The wave scheduler turns ~656 µs of sequential work into ~231 µs end-to-end,
@@ -305,6 +305,11 @@ Interpretation:
 - A completion-channel wave executor was tried and reverted: it was ~8 µs
   slower than `sync.WaitGroup` + a watcher on the 3-task wave, in both run
   orders.
+- **Fast-fail adds one shared early slot per concurrent wave** — one small
+  allocation — and leaves the success path unchanged: `Fanout` 56.4 µs and
+  `FanoutLatency` 332 µs. Its benefit is on failures: the first skill returning
+  an error or a non-zero `Response` cancels the wave instead of waiting for the
+  slowest sibling.
 - Inline waves are a real win (3.5×) only for CPU-trivial waves; they are a
   loss (2×) for I/O waves, hence opt-in.
 

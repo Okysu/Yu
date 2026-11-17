@@ -61,7 +61,7 @@ func parseItem(miss CacheMiss, req yu.Request) (Item, error) {
 
 	var item Item
 	if err := req.BindJSON(&item); err != nil {
-		return Item{}, err
+		return Item{}, &yu.HTTPError{Status: 400, Err: err}
 	}
 	return item, nil
 }

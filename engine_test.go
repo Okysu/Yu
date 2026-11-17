@@ -2,6 +2,7 @@ package yu
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -120,6 +121,62 @@ func TestEngineTimeout(t *testing.T) {
 	w := serve(e, "GET", "/slow", nil)
 	if w.Code != http.StatusGatewayTimeout {
 		t.Fatalf("timeout = %d, want 504 (body %q)", w.Code, w.Body.String())
+	}
+}
+
+func TestEngineTimeoutPreemptsSingleNode(t *testing.T) {
+	e := New()
+	e.GET("/slow-sync", WithTimeout(20*time.Millisecond), func(req Request) Response {
+		time.Sleep(300 * time.Millisecond)
+		return Text(200, "late")
+	})
+
+	start := time.Now()
+	w := serve(e, "GET", "/slow-sync", nil)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("timeout = %d, want 504", w.Code)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Fatalf("timed single-node wave was not preempted: %v", elapsed)
+	}
+}
+
+func TestEngineHTTPError(t *testing.T) {
+	e := New()
+	e.GET("/bad",
+		func(req Request) (engineSvc, error) {
+			return engineSvc{}, &HTTPError{Status: http.StatusBadRequest, Err: errors.New("bad input")}
+		},
+		func(engineSvc) Response { return Text(200, "ok") },
+	)
+
+	w := serve(e, "GET", "/bad", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if strings.TrimSpace(w.Body.String()) != "Bad Request" {
+		t.Fatalf("body = %q", w.Body.String())
+	}
+}
+
+func TestEngineClose(t *testing.T) {
+	e := New()
+	e.GET("/ping", func(req Request) Response { return Text(200, "pong") })
+	e.GET("/items",
+		PartitionBy(func(req Request) string { return "k" }, 2),
+		func(req Request) Response { return Text(200, "item") },
+	)
+
+	e.Close()
+	e.Close()
+
+	if w := serve(e, "GET", "/ping", nil); w.Code != http.StatusOK {
+		t.Fatalf("non-partitioned route after Close = %d", w.Code)
+	}
+	if w := serve(e, "GET", "/items", nil); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("partitioned route after Close = %d, want 503", w.Code)
 	}
 }
 

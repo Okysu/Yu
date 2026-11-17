@@ -187,20 +187,22 @@ e.EnableDebugDAG("/debug/dag")
 ```
 yu.go         Engine、Request、Response、HTTP 入口
 dag.go        技能反射、拓扑编译、wave 调度、panic/超时处理
+http_error.go 带状态码的错误映射
 router.go     trie 路由与路由条目
 trie.go       路由树节点
 group.go      路由分组
 partition.go  分片调度器与路由选项
 debug.go      拓扑可视化
 docs/         文档：quickstart、advanced、API、benchmarks
-examples/     可运行示例
+examples/     可运行示例：quickstart、advanced、middleware
 benchmarks/   独立模块的框架对比基准
 ```
 
 ## 设计约束
 
 - 技能必须是纯函数：不要修改 `Request`、单例或上游产出的共享对象。框架保证容器只读，但对象内部状态仍由你负责。
-- 波次是屏障：同一 wave 内的 error 和 `Response` 只在该 wave 全部结束后处理，一个节点失败不会阻止兄弟节点执行；取消是协作式的，不会抢占正在运行的函数，也不会回滚已完成的副作用。
+- 并发 wave 快速失败：第一个返回 error 或非零 `Response` 的节点会取消同 wave 的其他节点并立即返回；但取消是协作式的，不会抢占正在执行的函数，也不会回滚已开始的副作用。单节点/inline wave 顺序执行。
+- 横切能力（CORS、压缩、访问日志、指标）放在引擎外：`*Engine` 实现了 `http.Handler`，用标准 net/http 中间件包装即可。
 - 技能 panic 会被恢复并记录到服务端日志；客户端只会收到 500，不暴露内部细节。
 - 需要在「同一个值上做不同阶段的加工」时，请定义不同类型：
 

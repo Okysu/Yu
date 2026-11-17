@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -322,9 +323,12 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 			return Response{}, mapContextErr(err)
 		}
 
-		// Sequential path: single-node waves and any wave explicitly capped by
-		// WithInlineWaveLimit. No goroutine is started for these.
-		if len(wave) <= inlineLimit {
+		// Sequential path: waves explicitly capped by WithInlineWaveLimit, plus
+		// single-node waves without a deadline. A timed single-node wave goes
+		// through the concurrent path so the deadline can abort the wait even
+		// if the skill ignores its context.
+		_, timed := ctx.Deadline()
+		if len(wave) <= inlineLimit && !(timed && len(wave) == 1) {
 			for _, n := range wave {
 				args, err := n.acquireArgs(blackboard)
 				if err != nil {
@@ -351,12 +355,11 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 			continue
 		}
 
-		// Concurrent path.
-		type nodeResult struct {
-			outs []reflect.Value
-			err  error
-		}
-		results := make([]nodeResult, len(wave))
+		// Concurrent path. The first node that returns an error or a non-zero
+		// Response claims the early slot, cancels the wave, and lets the
+		// request return without waiting for its siblings.
+		results := make([]waveResult, len(wave))
+		var early int32 = -1
 		var wg sync.WaitGroup
 		wg.Add(len(wave))
 
@@ -365,13 +368,24 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 				defer wg.Done()
 				args, err := n.acquireArgs(blackboard)
 				if err != nil {
-					results[i] = nodeResult{err: err}
+					results[i] = waveResult{err: err}
+					if atomic.CompareAndSwapInt32(&early, -1, int32(i)) {
+						cancel()
+					}
 					return
 				}
 				// Guard each child goroutine with safeCall to capture panics and errors.
 				outs, callErr := safeCall(n, *args)
 				n.releaseArgs(args)
-				results[i] = nodeResult{outs: outs, err: callErr}
+				results[i] = waveResult{outs: outs, err: callErr}
+
+				abort := callErr != nil
+				if !abort {
+					_, abort = findResponse(outs)
+				}
+				if abort && atomic.CompareAndSwapInt32(&early, -1, int32(i)) {
+					cancel()
+				}
 			}(idx, node)
 		}
 
@@ -381,12 +395,18 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 			close(doneCh)
 		}()
 
-		// Wait for every node in this wave, or abort early on cancellation/timeout.
+		// Wait for every node, the first terminal signal, or cancellation.
 		select {
 		case <-doneCh:
+			if idx := atomic.LoadInt32(&early); idx >= 0 {
+				return interpretWaveResult(results[idx], ctx)
+			}
 		case <-ctx.Done():
 			keepBoard = true
 			cancel()
+			if idx := atomic.LoadInt32(&early); idx >= 0 {
+				return interpretWaveResult(results[idx], ctx)
+			}
 			return Response{}, mapContextErr(ctx.Err())
 		}
 
@@ -414,6 +434,42 @@ func (dag *CompiledDAG) Run(ctx context.Context, singletons map[reflect.Type]ref
 	}
 
 	return Response{}, fmt.Errorf("yu: pipeline finished without producing Response")
+}
+
+// waveResult is the outcome of a single skill in a concurrent wave.
+type waveResult struct {
+	outs []reflect.Value
+	err  error
+}
+
+// findResponse returns the first non-zero Response among a skill's outputs.
+func findResponse(outs []reflect.Value) (Response, bool) {
+	for _, out := range outs {
+		if out.Type() == respType {
+			if r := out.Interface().(Response); r.Status != 0 || len(r.Body) > 0 {
+				return r, true
+			}
+		}
+	}
+	return Response{}, false
+}
+
+// interpretWaveResult turns the node that won the early slot into a route
+// result. A deadline still wins over the skill's own error.
+func interpretWaveResult(res waveResult, ctx context.Context) (Response, error) {
+	if res.err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return Response{}, ErrRouteTimeout
+		}
+		return Response{}, res.err
+	}
+	if resp, ok := findResponse(res.outs); ok {
+		return resp, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return Response{}, mapContextErr(err)
+	}
+	return Response{}, fmt.Errorf("yu: wave aborted without a terminal result")
 }
 
 // acquireArgs fills a pooled argument slice for the node's declared inputs.

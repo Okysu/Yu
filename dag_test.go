@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -318,6 +319,91 @@ func TestRunReturnsSkillError(t *testing.T) {
 	_, err := dag.Run(context.Background(), nil, Request{})
 	if err == nil || !strings.Contains(err.Error(), "skill failed") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRunFailsFastWithinWave(t *testing.T) {
+	var canceled int32
+	slowDone := make(chan struct{})
+
+	fastErr := func(req Request) (dagA, error) {
+		return dagA{}, errors.New("boom")
+	}
+	slow := func(req Request) (dagB, error) {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-req.Context.Done():
+			atomic.StoreInt32(&canceled, 1)
+		}
+		close(slowDone)
+		return dagB{}, req.Context.Err()
+	}
+	merge := func(a dagA, b dagB) Response { return Text(200, "ok") }
+
+	dag := CompileDAG("GET-/fastfail", nil, fastErr, slow, merge)
+
+	start := time.Now()
+	_, err := dag.Run(context.Background(), nil, Request{})
+	elapsed := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want boom", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("wave did not fail fast: %v", elapsed)
+	}
+
+	select {
+	case <-slowDone:
+	case <-time.After(time.Second):
+		t.Fatal("slow sibling was not cancelled")
+	}
+	if atomic.LoadInt32(&canceled) != 1 {
+		t.Fatal("slow sibling did not observe context cancellation")
+	}
+}
+
+func TestRunFastResponseSkipsSibling(t *testing.T) {
+	var canceled int32
+	slowDone := make(chan struct{})
+
+	fastResp := func(req Request) (dagA, Response) {
+		return dagA{}, Text(200, "fast")
+	}
+	slow := func(req Request) (dagB, error) {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-req.Context.Done():
+			atomic.StoreInt32(&canceled, 1)
+		}
+		close(slowDone)
+		return dagB{}, req.Context.Err()
+	}
+	merge := func(a dagA, b dagB) Response { return Text(200, "ok") }
+
+	dag := CompileDAG("GET-/fastresp", nil, fastResp, slow, merge)
+
+	start := time.Now()
+	resp, err := dag.Run(context.Background(), nil, Request{})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if resp.String() != "fast" {
+		t.Fatalf("body = %q", resp.String())
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("response did not short-circuit the wave: %v", elapsed)
+	}
+
+	select {
+	case <-slowDone:
+	case <-time.After(time.Second):
+		t.Fatal("slow sibling was not cancelled")
+	}
+	if atomic.LoadInt32(&canceled) != 1 {
+		t.Fatal("slow sibling did not observe context cancellation")
 	}
 }
 

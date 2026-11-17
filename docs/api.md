@@ -20,6 +20,7 @@ func (engine *Engine) Provide(items ...any)
 func (engine *Engine) Run(addr string) error
 func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request)
 func (engine *Engine) EnableDebugDAG(path string)
+func (engine *Engine) Close()
 ```
 
 `Engine` embeds `*RouterGroup`, so every route method is available directly on
@@ -32,6 +33,7 @@ the engine.
 | `Run` | Starts `http.ListenAndServe(addr, engine)`. |
 | `ServeHTTP` | Standard `http.Handler` entry point; useful with `httptest`. |
 | `EnableDebugDAG` | Registers a topology inspector at `path`. `?format=json` returns structured data. The route is flagged internal and excluded from the listing. |
+| `Close` | Closes every route partition scheduler. Idempotent. New dispatches get `ErrSchedulerClosed` (`503`); queued tasks are drained. |
 
 ## RouterGroup
 
@@ -168,14 +170,19 @@ func (ps *PartitionScheduler) Dispatch(
 	req Request,
 	exec func() (Response, error),
 ) (Response, error)
+
+func (ps *PartitionScheduler) Close()
 ```
 
 `NewPartitionScheduler` defaults `workers <= 0` to `1`. `Dispatch` waits for a
 lane slot and for execution, honouring `ctx` in both phases. Skill panics
-inside a lane are recovered per task.
+inside a lane are recovered per task. `Close` is idempotent and drains buffered
+tasks before the lane worker exits; dispatches after `Close` return
+`ErrSchedulerClosed`.
 
-Most applications should use `PartitionBy` rather than constructing a
-scheduler directly.
+A scheduler is created per partitioned route: the same key on different routes
+is not mutually exclusive. Lanes are hash buckets, so different keys may share
+a lane.
 
 ## Compilation
 
@@ -223,10 +230,27 @@ The route-level equivalent is `WithInlineWaveLimit`.
 
 ```go
 var ErrRouteTimeout = errors.New("yu: route execution timed out")
+var ErrSchedulerClosed = errors.New("yu: partition scheduler is closed")
+
+type HTTPError struct {
+	Status int
+	Err    error
+}
+
+func (e *HTTPError) Error() string
+func (e *HTTPError) Unwrap() error
 ```
 
-`ServeHTTP` maps `ErrRouteTimeout` to `504 Gateway Timeout`. Other errors map
-to `500 Internal Server Error`; details are written to the server log only.
+`ServeHTTP` maps errors as follows:
+
+| error | response |
+|---|---|
+| `ErrRouteTimeout` | `504 Gateway Timeout` |
+| `ErrSchedulerClosed` | `503 Service Unavailable` |
+| `*HTTPError` with status 400–599 | that status; body is the status text |
+| anything else | `500 Internal Server Error` |
+
+The wrapped error is always logged server-side; it is never sent to the client.
 
 ## Debug types
 

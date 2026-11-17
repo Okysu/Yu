@@ -139,6 +139,23 @@ func (engine *Engine) Run(addr string) error {
 	return http.ListenAndServe(addr, engine)
 }
 
+// Close releases the partition schedulers created for partitioned routes.
+// It is safe to call more than once. In-flight requests are not interrupted;
+// tasks already queued in a lane are drained by its worker.
+func (engine *Engine) Close() {
+	seen := make(map[*PartitionScheduler]struct{})
+	for _, entry := range engine.router.entries {
+		if entry.scheduler == nil {
+			continue
+		}
+		if _, ok := seen[entry.scheduler]; ok {
+			continue
+		}
+		seen[entry.scheduler] = struct{}{}
+		entry.scheduler.Close()
+	}
+}
+
 // addRoute adds a route with a compiled DAG pipeline.
 func (engine *Engine) addRoute(method, pattern string, items ...any) {
 	key := method + "-" + pattern
@@ -252,6 +269,18 @@ func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "504 Gateway Timeout: "+err.Error(), http.StatusGatewayTimeout)
 			return
 		}
+		if errors.Is(err, ErrSchedulerClosed) {
+			http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) && httpErr.Status >= 400 && httpErr.Status <= 599 {
+			log.Printf("[Yu Error] %s %s: %v", req.Method, req.URL.Path, err)
+			http.Error(w, http.StatusText(httpErr.Status), httpErr.Status)
+			return
+		}
+
 		// Keep internal details in the server log, not in the response body.
 		log.Printf("[Yu Error] %s %s: %v", req.Method, req.URL.Path, err)
 		http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"testing"
@@ -159,6 +160,56 @@ func TestPartitionSchedulerLaneSurvivesPanic(t *testing.T) {
 	}
 	if resp.Status != 200 || resp.String() != "ok" {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestFNV32aMatchesStdlib(t *testing.T) {
+	for _, s := range []string{"", "a", "key-42", "订单-42"} {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(s))
+		if got, want := fnv32a(s), h.Sum32(); got != want {
+			t.Fatalf("fnv32a(%q) = %d, want %d", s, got, want)
+		}
+	}
+}
+
+func TestPartitionSchedulerClose(t *testing.T) {
+	ps := NewPartitionScheduler(2, func(Request) string { return "k" })
+	ps.Close()
+	ps.Close()
+
+	_, err := ps.Dispatch(context.Background(), Request{}, func() (Response, error) {
+		return Text(200, "ok"), nil
+	})
+	if !errors.Is(err, ErrSchedulerClosed) {
+		t.Fatalf("err = %v, want ErrSchedulerClosed", err)
+	}
+}
+
+func TestPartitionSchedulerCloseConcurrent(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		ps := NewPartitionScheduler(4, func(Request) string { return "k" })
+
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = ps.Dispatch(context.Background(), Request{}, func() (Response, error) {
+					return Text(200, "ok"), nil
+				})
+			}()
+		}
+
+		ps.Close()
+
+		if _, err := ps.Dispatch(context.Background(), Request{}, func() (Response, error) {
+			return Text(200, "ok"), nil
+		}); !errors.Is(err, ErrSchedulerClosed) {
+			t.Fatalf("post-close dispatch err = %v", err)
+		}
+
+		wg.Wait()
 	}
 }
 
