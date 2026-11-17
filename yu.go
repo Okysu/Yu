@@ -6,50 +6,61 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"reflect"
+	"strings"
 )
 
 // Engine is the core of the Yu framework.
 type Engine struct {
 	*RouterGroup
 	router     *router
-	groups     []*RouterGroup
 	singletons map[reflect.Type]reflect.Value // global singletons
 }
 
-// Request is an immutable request packet (value passed, naturally thread-safe).
+// Request is an immutable request packet. Its containers are unexported and
+// only exposed through read-only accessors, so skills running in the same wave
+// cannot mutate shared state by accident.
 type Request struct {
 	Method     string
 	Path       string
 	RawQuery   string
-	Query      map[string][]string
-	Params     map[string]string
-	Header     map[string][]string
-	Body       []byte
-	RemoteAddr string
 	Context    context.Context
+	RemoteAddr string
+
+	query  map[string][]string
+	params map[string]string
+	header http.Header
+	body   []byte
 }
 
 // Param returns the dynamic route parameter by key (e.g., ":id" or "*filepath").
 func (r Request) Param(key string) string {
-	if val, ok := r.Params[key]; ok {
-		return val
-	}
-	return ""
+	return r.params[key]
 }
 
 // QueryDefault returns the first query value or a default.
 func (r Request) QueryDefault(key, def string) string {
-	if vals, ok := r.Query[key]; ok && len(vals) > 0 {
+	if vals, ok := r.query[key]; ok && len(vals) > 0 {
 		return vals[0]
 	}
 	return def
 }
 
+// Get returns the first value of the named request header.
+func (r Request) Get(key string) string {
+	return r.header.Get(key)
+}
+
+// Body returns the raw request body. It must be treated as read-only.
+func (r Request) Body() []byte {
+	return r.body
+}
+
 // BindJSON decodes the request body into dst.
 func (r Request) BindJSON(dst any) error {
-	return json.Unmarshal(r.Body, dst)
+	return json.Unmarshal(r.body, dst)
 }
 
 // Response is the final immutable response packet produced by the business pipeline.
@@ -59,9 +70,17 @@ type Response struct {
 	Body   []byte
 }
 
-// JSON creates a JSON response.
+// JSON creates a JSON response. A marshalling failure is reported as 500
+// instead of silently returning an empty body.
 func JSON(status int, data any) Response {
-	b, _ := json.Marshal(data)
+	b, err := json.Marshal(data)
+	if err != nil {
+		return Response{
+			Status: http.StatusInternalServerError,
+			Header: map[string]string{"Content-Type": "text/plain; charset=utf-8"},
+			Body:   []byte("yu: failed to marshal JSON response: " + err.Error()),
+		}
+	}
 	return Response{
 		Status: status,
 		Header: map[string]string{"Content-Type": "application/json; charset=utf-8"},
@@ -83,14 +102,13 @@ func (r Response) String() string {
 	return string(r.Body)
 }
 
-// Engine is the core of the Yu framework.
+// New returns a new Engine.
 func New() *Engine {
 	engine := &Engine{
 		router:     newRouter(),
 		singletons: make(map[reflect.Type]reflect.Value),
 	}
 	engine.RouterGroup = &RouterGroup{engine: engine}
-	engine.groups = []*RouterGroup{engine.RouterGroup}
 	return engine
 }
 
@@ -100,7 +118,18 @@ func (engine *Engine) Provide(items ...any) {
 		if item == nil {
 			panic("yu: cannot provide nil singleton")
 		}
+
 		v := reflect.ValueOf(item)
+		switch v.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+			if v.IsNil() {
+				panic(fmt.Sprintf("yu: cannot provide nil singleton for type %v", v.Type()))
+			}
+		}
+
+		if _, exists := engine.singletons[v.Type()]; exists {
+			panic(fmt.Sprintf("yu: singleton %v is already provided", v.Type()))
+		}
 		engine.singletons[v.Type()] = v
 	}
 }
@@ -132,42 +161,61 @@ func (engine *Engine) addRoute(method, pattern string, items ...any) {
 		modeDesc = fmt.Sprintf("Sharded(%d lanes)", cfg.workers)
 	}
 
-	fmt.Printf("[Yu Compiler] Route %-22s -> %d wave(s) | Mode: %s\n", key, len(dag.Waves), modeDesc)
+	log.Printf("[Yu Compiler] Route %-22s -> %d wave(s) | Mode: %s", key, len(dag.Waves), modeDesc)
 	engine.router.addRoute(method, pattern, &routeEntry{
 		dag:       dag,
 		scheduler: scheduler,
 		timeout:   cfg.timeout,
+		bodyLimit: cfg.bodyLimit,
 	})
 }
 
 // ServeHTTP implements http.Handler.
 func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	n, params := engine.router.getRoute(req.Method, req.URL.Path)
-	if n == nil {
+	entry, params := engine.router.getRoute(req.Method, req.URL.Path)
+	if entry == nil {
+		if allowed := engine.router.allowedMethods(req.URL.Path); len(allowed) > 0 {
+			w.Header().Set("Allow", strings.Join(allowed, ", "))
+			http.Error(w, "405 Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		http.NotFound(w, req)
 		return
 	}
-
-	key := req.Method + "-" + n.pattern
-	entry := engine.router.entries[key]
 
 	// freeze request into immutable value
 	var bodyBytes []byte
 	if req.Body != nil {
 		defer req.Body.Close()
-		bodyBytes, _ = io.ReadAll(req.Body)
+
+		var reader io.Reader = req.Body
+		if entry.bodyLimit > 0 {
+			reader = http.MaxBytesReader(w, req.Body, entry.bodyLimit)
+		}
+
+		var readErr error
+		bodyBytes, readErr = io.ReadAll(reader)
+		if readErr != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(readErr, &maxErr) {
+				http.Error(w, "413 Request Entity Too Large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "400 Bad Request: failed to read request body", http.StatusBadRequest)
+			return
+		}
 	}
 
 	frozenReq := Request{
 		Method:     req.Method,
 		Path:       req.URL.Path,
-		Header:     req.Header.Clone(),
 		RawQuery:   req.URL.RawQuery,
-		Query:      req.URL.Query(),
-		Body:       bodyBytes,
-		Context:    req.Context(),
+		query:      req.URL.Query(),
+		params:     params,
+		header:     req.Header.Clone(),
+		body:       bodyBytes,
 		RemoteAddr: req.RemoteAddr,
-		Params:     params,
+		Context:    req.Context(),
 	}
 
 	ctx := req.Context()
@@ -184,7 +232,7 @@ func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	var resp Response
 	var err error
 	if entry.scheduler != nil {
-		resp, err = entry.scheduler.Dispatch(frozenReq, execFn)
+		resp, err = entry.scheduler.Dispatch(ctx, frozenReq, execFn)
 	} else {
 		resp, err = execFn()
 	}
@@ -194,7 +242,9 @@ func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "504 Gateway Timeout: "+err.Error(), http.StatusGatewayTimeout)
 			return
 		}
-		http.Error(w, fmt.Sprintf("500 Internal Server Error: %v", err), http.StatusInternalServerError)
+		// Keep internal details in the server log, not in the response body.
+		log.Printf("[Yu Error] %s %s: %v", req.Method, req.URL.Path, err)
+		http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 

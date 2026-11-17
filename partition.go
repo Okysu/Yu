@@ -1,7 +1,11 @@
 package yu
 
 import (
+	"context"
+	"fmt"
 	"hash/fnv"
+	"log"
+	"runtime/debug"
 	"time"
 )
 
@@ -15,9 +19,10 @@ type RouteOption interface {
 }
 
 type routeConfig struct {
-	keyFn   PartitionKeyFunc
-	workers int
-	timeout time.Duration
+	keyFn     PartitionKeyFunc
+	workers   int
+	timeout   time.Duration
+	bodyLimit int64
 }
 
 type partitionOption struct {
@@ -53,6 +58,20 @@ func WithTimeout(d time.Duration) RouteOption {
 	return timeoutOption{d: d}
 }
 
+type bodyLimitOption struct {
+	maxBytes int64
+}
+
+func (o bodyLimitOption) apply(cfg *routeConfig) {
+	cfg.bodyLimit = o.maxBytes
+}
+
+// WithBodyLimit caps the request body size for a route. Larger bodies are
+// rejected with 413 Request Entity Too Large. maxBytes <= 0 disables the limit.
+func WithBodyLimit(maxBytes int64) RouteOption {
+	return bodyLimitOption{maxBytes: maxBytes}
+}
+
 type partitionTask struct {
 	fn   func() (Response, error)
 	done chan partitionResult
@@ -73,6 +92,9 @@ type PartitionScheduler struct {
 // NewPartitionScheduler initializes a PartitionScheduler with the specified number of worker
 // lanes and key extraction function.
 func NewPartitionScheduler(workers int, keyFn PartitionKeyFunc) *PartitionScheduler {
+	if workers <= 0 {
+		workers = 1
+	}
 	lanes := make([]chan partitionTask, workers)
 	for i := 0; i < workers; i++ {
 		// Each channel includes a buffer queue to smoothly absorb traffic bursts.
@@ -80,8 +102,7 @@ func NewPartitionScheduler(workers int, keyFn PartitionKeyFunc) *PartitionSchedu
 		lanes[i] = ch
 		go func(queue <-chan partitionTask) {
 			for task := range queue {
-				resp, err := task.fn()
-				task.done <- partitionResult{resp: resp, err: err}
+				task.done <- runPartitionTask(task.fn)
 			}
 		}(ch)
 	}
@@ -91,20 +112,46 @@ func NewPartitionScheduler(workers int, keyFn PartitionKeyFunc) *PartitionSchedu
 	}
 }
 
-// Dispatch routes a request to its designated worker queue based on the hashed key
-// and blocks until execution completes.
-func (ps *PartitionScheduler) Dispatch(req Request, exec func() (Response, error)) (Response, error) {
-	key := ps.keyFn(req)
+// laneFor returns the lane index a key is pinned to.
+func (ps *PartitionScheduler) laneFor(key string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
-	laneIdx := int(h.Sum32()) % len(ps.lanes)
+	return int(h.Sum32()) % len(ps.lanes)
+}
 
+// Dispatch routes a request to its designated worker queue based on the hashed key
+// and blocks until execution completes or ctx is cancelled.
+//
+// Cancellation is honoured while the task waits in the queue and while it runs,
+// so a route timeout is never stretched by a backlogged lane.
+func (ps *PartitionScheduler) Dispatch(ctx context.Context, req Request, exec func() (Response, error)) (Response, error) {
+	lane := ps.lanes[ps.laneFor(ps.keyFn(req))]
 	done := make(chan partitionResult, 1)
-	ps.lanes[laneIdx] <- partitionTask{
-		fn:   exec,
-		done: done,
+
+	select {
+	case lane <- partitionTask{fn: exec, done: done}:
+	case <-ctx.Done():
+		return Response{}, mapContextErr(ctx.Err())
 	}
 
-	res := <-done
-	return res.resp, res.err
+	select {
+	case res := <-done:
+		return res.resp, res.err
+	case <-ctx.Done():
+		// The task may still run later; done is buffered so the worker never blocks.
+		return Response{}, mapContextErr(ctx.Err())
+	}
+}
+
+// runPartitionTask isolates a lane from panics: a crashing task must not
+// permanently kill the worker goroutine that serializes a shard.
+func runPartitionTask(fn func() (Response, error)) (result partitionResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Yu Recovery] Panic recovered in partition worker: %v\n%s", r, debug.Stack())
+			result = partitionResult{err: fmt.Errorf("yu: partition worker panicked: %v", r)}
+		}
+	}()
+	resp, err := fn()
+	return partitionResult{resp: resp, err: err}
 }

@@ -1,6 +1,7 @@
 package yu
 
 import (
+	"sort"
 	"strings"
 	"time"
 )
@@ -9,6 +10,8 @@ type routeEntry struct {
 	dag       *CompiledDAG
 	scheduler *PartitionScheduler
 	timeout   time.Duration
+	bodyLimit int64
+	internal  bool
 }
 
 type router struct {
@@ -41,37 +44,71 @@ func parsePattern(pattern string) []string {
 
 // addRoute adds route to router
 func (r *router) addRoute(method string, pattern string, entry *routeEntry) {
+	if pattern == "" {
+		panic("yu: route pattern must not be empty")
+	}
+
 	parts := parsePattern(pattern)
 	key := method + "-" + pattern
 
-	if _, ok := r.roots[method]; !ok {
-		r.roots[method] = &node{}
+	root, ok := r.roots[method]
+	if !ok {
+		root = &node{}
+		r.roots[method] = root
 	}
-	r.roots[method].insert(pattern, parts, 0)
+
+	leaf := root.insert(pattern, parts, 0)
+	leaf.entry = entry
 	r.entries[key] = entry
 }
 
-// getRoute returns route for method and path
-func (r *router) getRoute(method string, path string) (*node, map[string]string) {
-	searchParts := parsePattern(path)
-	params := make(map[string]string)
+// getRoute returns the compiled entry and path parameters for the request.
+func (r *router) getRoute(method string, path string) (*routeEntry, map[string]string) {
 	root, ok := r.roots[method]
 	if !ok {
 		return nil, nil
 	}
+
+	searchParts := parsePattern(path)
 	n := root.search(searchParts, 0)
-	if n != nil {
-		parts := parsePattern(n.pattern)
-		for index, part := range parts {
-			if part[0] == ':' {
-				params[part[1:]] = searchParts[index]
-			}
-			if part[0] == '*' && len(part) > 1 {
-				params[part[1:]] = strings.Join(searchParts[index:], "/")
-				break
-			}
-		}
-		return n, params
+	if n == nil || n.entry == nil {
+		return nil, nil
 	}
-	return nil, nil
+
+	params := make(map[string]string)
+	for index, part := range parsePattern(n.pattern) {
+		if index >= len(searchParts) {
+			break
+		}
+		switch part[0] {
+		case ':':
+			params[part[1:]] = searchParts[index]
+		case '*':
+			if len(part) > 1 {
+				params[part[1:]] = strings.Join(searchParts[index:], "/")
+			}
+			return n.entry, params
+		}
+	}
+	return n.entry, params
+}
+
+// allowedMethods returns the sorted methods that have a route matching path.
+func (r *router) allowedMethods(path string) []string {
+	searchParts := parsePattern(path)
+	methods := make([]string, 0, len(r.roots))
+	for method, root := range r.roots {
+		if n := root.search(searchParts, 0); n != nil && n.entry != nil {
+			methods = append(methods, method)
+		}
+	}
+	sort.Strings(methods)
+	return methods
+}
+
+// markInternal flags a route so it is hidden from the topology inspector.
+func (r *router) markInternal(method, pattern string) {
+	if entry, ok := r.entries[method+"-"+pattern]; ok {
+		entry.internal = true
+	}
 }

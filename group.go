@@ -3,10 +3,13 @@ package yu
 import "strings"
 
 // RouterGroup represents a group of routes with a common prefix.
+//
+// Nodes registered on a group are not middleware: they are merged into the
+// same type-driven DAG as the route's own nodes, and the engine orders them
+// purely by type dependencies.
 type RouterGroup struct {
 	prefix string
-	node   []any
-	parent *RouterGroup
+	nodes  []any
 	engine *Engine
 }
 
@@ -24,24 +27,22 @@ func joinPaths(absolutePath, relativePath string) string {
 
 // Group creates a new RouterGroup with the given prefix and nodes.
 func (group *RouterGroup) Group(relativePath string, nodes ...any) *RouterGroup {
-	mergedNodes := make([]any, 0, len(group.node)+len(nodes))
-	mergedNodes = append(mergedNodes, group.node...)
+	mergedNodes := make([]any, 0, len(group.nodes)+len(nodes))
+	mergedNodes = append(mergedNodes, group.nodes...)
 	mergedNodes = append(mergedNodes, nodes...)
 
-	newGroup := &RouterGroup{
+	return &RouterGroup{
 		prefix: joinPaths(group.prefix, relativePath),
-		node:   mergedNodes,
-		parent: group,
+		nodes:  mergedNodes,
 		engine: group.engine,
 	}
-
-	group.engine.groups = append(group.engine.groups, newGroup)
-	return newGroup
 }
 
-// Use adds middleware to the group.
+// Use adds nodes to the group. They join the same causal DAG as route nodes,
+// so execution order is decided by types rather than by registration order.
+// Routes registered before Use are not affected.
 func (group *RouterGroup) Use(node ...any) *RouterGroup {
-	group.node = append(group.node, node...)
+	group.nodes = append(group.nodes, node...)
 	return group
 }
 
@@ -49,8 +50,8 @@ func (group *RouterGroup) Use(node ...any) *RouterGroup {
 func (group *RouterGroup) addRoute(method, comp string, handlers ...any) {
 	pattern := joinPaths(group.prefix, comp)
 
-	allNodes := make([]any, 0, len(group.node)+len(handlers))
-	allNodes = append(allNodes, group.node...)
+	allNodes := make([]any, 0, len(group.nodes)+len(handlers))
+	allNodes = append(allNodes, group.nodes...)
 	allNodes = append(allNodes, handlers...)
 
 	group.engine.addRoute(method, pattern, allNodes...)
@@ -71,12 +72,12 @@ func (group *RouterGroup) PUT(pattern string, nodes ...any) {
 	group.addRoute("PUT", pattern, nodes...)
 }
 
-// PUT adds a PUT route to the group.
+// DELETE adds a DELETE route to the group.
 func (group *RouterGroup) DELETE(pattern string, nodes ...any) {
 	group.addRoute("DELETE", pattern, nodes...)
 }
 
-// DELETE adds a DELETE route to the group.
+// PATCH adds a PATCH route to the group.
 func (group *RouterGroup) PATCH(pattern string, nodes ...any) {
 	group.addRoute("PATCH", pattern, nodes...)
 }

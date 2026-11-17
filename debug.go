@@ -25,9 +25,9 @@ type NodeDTO struct {
 
 func (engine *Engine) exportTopologies() []RouteTopologyDTO {
 	keys := make([]string, 0, len(engine.router.entries))
-	for k := range engine.router.entries {
-		// Skip internal debug routes to keep the business view clean.
-		if strings.Contains(k, "/debug/dag") {
+	for k, entry := range engine.router.entries {
+		// Skip internal routes (the inspector itself) to keep the business view clean.
+		if entry.internal {
 			continue
 		}
 		keys = append(keys, k)
@@ -141,4 +141,5 @@ func (engine *Engine) EnableDebugDAG(path string) {
 			Body:   []byte(sb.String()),
 		}
 	})
+	engine.router.markInternal("GET", joinPaths("", path))
 }
