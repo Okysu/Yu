@@ -326,8 +326,15 @@ func TestEngineDebugEndpoint(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("debug html = %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "Deterministic Concurrency Topology") {
+	html := w.Body.String()
+	if !strings.Contains(html, "Deterministic Concurrency Topology") {
 		t.Fatal("debug HTML missing title")
+	}
+	if !strings.Contains(html, `id="route-search"`) {
+		t.Fatal("debug HTML missing search input")
+	}
+	if !strings.Contains(html, `id="theme-toggle"`) || !strings.Contains(html, `data-theme="light"`) {
+		t.Fatal("debug HTML missing light/dark theme support")
 	}
 }
 
