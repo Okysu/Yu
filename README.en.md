@@ -25,7 +25,7 @@ the engine compile a topology at startup.
 
 > Guide, don't block. Let causality drive itself. — Yu
 
-Requires Go 1.26+.
+Requires Go 1.22+.
 
 ## Install
 

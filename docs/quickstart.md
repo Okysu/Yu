@@ -6,7 +6,7 @@ shows how to inspect the result.
 
 ## Requirements
 
-- Go 1.26 or newer
+- Go 1.22 or newer
 
 ## Install
 
